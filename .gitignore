@@ -19,3 +19,6 @@ env/
 *.swo
 *~
 .cache/
+bot.py.old
+.claude/
+get-docker.sh
