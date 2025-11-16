@@ -1,0 +1,32 @@
+# URLs para Probar el Bot
+
+## Videos Cortos (funcionan rápido)
+
+# YouTube Short
+https://www.youtube.com/shorts/jNQXAC9IVRw
+
+# TikTok
+https://www.tiktok.com/@tiktok/video/7106594312292453675
+
+# Instagram Reel
+https://www.instagram.com/reel/C1aBcDeFgHi/
+
+# Twitter Video
+https://twitter.com/Twitter/status/1445078208190291973
+
+# Reddit Video
+https://www.reddit.com/r/aww/comments/xxxxx/
+
+## Videos Medianos
+
+# YouTube Video Normal
+https://www.youtube.com/watch?v=dQw4w9WgXcQ
+
+# Vimeo
+https://vimeo.com/148751763
+
+## Notas:
+- Copia una URL
+- Pégala en el chat con @chinaenbiciBot
+- El bot descargará y enviará el video
+- Los archivos se eliminan automáticamente después
