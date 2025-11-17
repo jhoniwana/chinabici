@@ -6,9 +6,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 import yt_dlp
 import aiofiles
+from gallery_dl import config as gdl_config, job as gdl_job
+import tempfile
+import shutil
+from bs4 import BeautifulSoup
+import aiohttp
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -73,15 +78,259 @@ async def cleanup_file(filepath: str):
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
+async def cleanup_directory(dirpath: str):
+    try:
+        if os.path.exists(dirpath):
+            await asyncio.to_thread(shutil.rmtree, dirpath)
+            logger.info(f"Cleaned up directory: {dirpath}")
+    except Exception as e:
+        logger.error(f"Directory cleanup error: {e}")
+
 def is_youtube(url: str) -> bool:
     return 'youtube.com' in url or 'youtu.be' in url
+
+def is_image_platform(url: str) -> bool:
+    """Check if URL is from a platform that might have images"""
+    return 'instagram.com' in url or 'facebook.com' in url
+
+def is_instagram_reel(url: str) -> bool:
+    """Check if URL is an Instagram reel (video)"""
+    return 'instagram.com' in url and '/reel/' in url
+
+def is_instagram_story(url: str) -> bool:
+    """Check if URL is an Instagram story"""
+    return 'instagram.com' in url and ('/stories/' in url or '/story/' in url)
+
+async def extract_images_info(url: str):
+    """Extract image information using gallery-dl"""
+    try:
+        # Create a custom DataJob to extract info without downloading
+        class InfoExtractor(gdl_job.DataJob):
+            def __init__(self, url):
+                super().__init__(url)
+                self.results = []
+
+            def handle_url(self, url, kwdict):
+                self.results.append(kwdict)
+
+        job = InfoExtractor(url)
+        await asyncio.to_thread(job.run)
+
+        return job.results if job.results else None
+    except Exception as e:
+        logger.error(f"gallery-dl info extraction error: {e}")
+        return None
+
+async def scrape_facebook_images(url: str, temp_dir: str):
+    """Scrape images directly from Facebook HTML (fallback method)"""
+    try:
+        # Use curl via subprocess since aiohttp is being blocked by Facebook
+        import subprocess
+
+        curl_command = [
+            'curl', '-L', '-A',
+            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            url
+        ]
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            curl_command,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            logger.error(f"curl failed with return code: {result.returncode}")
+            return [], None
+
+        html = result.stdout
+        logger.info(f"Fetched {len(html)} bytes of HTML via curl")
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        # Find images and description from Open Graph meta tags
+        images = []
+        description = None
+
+        # Extract description from og:description
+        og_description = soup.find('meta', property='og:description')
+        if og_description and og_description.get('content'):
+            description = og_description['content']
+            logger.info(f"Found description: {description[:100]}")
+
+        # Extract image URLs from og:image meta tags
+        og_images = soup.find_all('meta', property='og:image')
+
+        if not og_images:
+            logger.info("No og:image tags found")
+            return [], None
+
+        for idx, og_img in enumerate(og_images):
+            img_url = og_img.get('content')
+
+            if img_url and 'fbcdn.net' in img_url:
+                # Unescape HTML entities in the URL
+                img_url = img_url.replace('&amp;', '&')
+
+                # Download the image using curl
+                try:
+                    import subprocess
+
+                    img_filename = os.path.join(temp_dir, f"facebook_image_{idx}.jpg")
+
+                    curl_img_command = [
+                        'curl', '-L', '-o', img_filename,
+                        '-A', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+                        img_url
+                    ]
+
+                    img_result = await asyncio.to_thread(
+                        subprocess.run,
+                        curl_img_command,
+                        capture_output=True,
+                        timeout=30
+                    )
+
+                    if img_result.returncode == 0 and os.path.exists(img_filename):
+                        images.append(img_filename)
+                        logger.info(f"Downloaded Facebook image {idx+1} from og:image: {img_filename}")
+                    else:
+                        logger.error(f"Failed to download image {idx}")
+                except Exception as e:
+                    logger.error(f"Failed to download image {idx}: {e}")
+                    continue
+
+        return images, description
+
+    except Exception as e:
+        logger.error(f"Facebook scraping error: {e}")
+        return [], None
+
+async def scrape_instagram_images(url: str, temp_dir: str):
+    """Scrape images directly from Instagram HTML"""
+    try:
+        import subprocess
+
+        curl_command = [
+            'curl', '-L', '-A',
+            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            url
+        ]
+
+        result = await asyncio.to_thread(
+            subprocess.run,
+            curl_command,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        if result.returncode != 0:
+            logger.error(f"curl failed with return code: {result.returncode}")
+            return [], None
+
+        html = result.stdout
+        logger.info(f"Fetched {len(html)} bytes of HTML via curl from Instagram")
+
+        soup = BeautifulSoup(html, 'lxml')
+
+        images = []
+        description = None
+
+        # Extract caption/description from various possible locations
+        # Try meta description first
+        og_description = soup.find('meta', property='og:description')
+        if og_description and og_description.get('content'):
+            description = og_description['content']
+            logger.info(f"Found Instagram description: {description[:100]}")
+
+        # Find all image tags with cdninstagram.com in src
+        img_tags = soup.find_all('img', src=lambda x: x and 'cdninstagram.com' in x)
+
+        if not img_tags:
+            logger.info("No Instagram CDN images found in HTML")
+            return [], None
+
+        logger.info(f"Found {len(img_tags)} Instagram images")
+
+        for idx, img_tag in enumerate(img_tags):
+            img_url = img_tag.get('src')
+
+            if img_url and 'cdninstagram.com' in img_url:
+                # Get alt text as additional description
+                alt_text = img_tag.get('alt', '')
+                if alt_text and not description:
+                    description = alt_text
+
+                # Download the image using curl
+                try:
+                    img_filename = os.path.join(temp_dir, f"instagram_image_{idx}.jpg")
+
+                    curl_img_command = [
+                        'curl', '-L', '-o', img_filename,
+                        '-A', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+                        img_url
+                    ]
+
+                    img_result = await asyncio.to_thread(
+                        subprocess.run,
+                        curl_img_command,
+                        capture_output=True,
+                        timeout=30
+                    )
+
+                    if img_result.returncode == 0 and os.path.exists(img_filename):
+                        # Verify file is actually an image (not an error page)
+                        if os.path.getsize(img_filename) > 1000:  # At least 1KB
+                            images.append(img_filename)
+                            logger.info(f"Downloaded Instagram image {idx+1}: {img_filename}")
+                        else:
+                            logger.warning(f"Image {idx} too small, skipping")
+                            os.remove(img_filename)
+                    else:
+                        logger.error(f"Failed to download Instagram image {idx}")
+                except Exception as e:
+                    logger.error(f"Failed to download Instagram image {idx}: {e}")
+                    continue
+
+        return images, description
+
+    except Exception as e:
+        logger.error(f"Instagram scraping error: {e}")
+        return [], None
+
+async def download_images(url: str, temp_dir: str):
+    """Download images using gallery-dl to a temporary directory"""
+    try:
+        # Configure gallery-dl
+        gdl_config.set(("extractor",), "base-directory", temp_dir)
+        gdl_config.set(("extractor",), "directory", ["."])
+
+        # Create download job
+        job = gdl_job.DownloadJob(url)
+        await asyncio.to_thread(job.run)
+
+        # Get all downloaded files
+        files = []
+        for root, dirs, filenames in os.walk(temp_dir):
+            for filename in filenames:
+                filepath = os.path.join(root, filename)
+                files.append(filepath)
+
+        return files
+    except Exception as e:
+        logger.error(f"gallery-dl download error: {e}")
+        return []
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "**Video Downloader Bot**\n\n"
-        "Send me any video link and I'll download it for you.\n\n"
+        "**Video & Image Downloader Bot**\n\n"
+        "Send me any video or image link and I'll download it for you.\n\n"
         "**YouTube:** Choose MP3 (audio) or MP4 (video)\n"
+        "**Instagram/Facebook:** Download images with captions or videos\n"
         "**Others:** Auto-download best quality\n\n"
         "Supported: YouTube, Instagram, TikTok, Facebook, Twitter, and 1000+ sites"
     )
@@ -115,8 +364,104 @@ async def handle_url(message: types.Message):
             "**YouTube detected!**\n\nChoose format:",
             reply_markup=keyboard
         )
+    elif is_instagram_reel(url) or is_instagram_story(url):
+        # Instagram reels and stories are videos - skip image detection
+        logger.info(f"Instagram video detected (reel/story): {url}")
+        await download_and_send(message, url, 'video')
+    elif is_image_platform(url):
+        # For Instagram posts and Facebook, try images first
+        # If it fails or has no images, it will fall back to video
+        await download_and_send_images(message, url)
     else:
         await download_and_send(message, url, 'video')
+
+async def download_and_send_images(message: types.Message, url: str):
+    """Download and send images from Instagram/Facebook posts"""
+    status_msg = await message.answer("⏳ Downloading images...")
+
+    temp_dir = None
+    try:
+        # Create temporary directory
+        temp_dir = tempfile.mkdtemp(prefix="images_", dir="downloads")
+
+        description = ""
+        image_files = []
+
+        # For Facebook, try HTML scraping
+        if 'facebook.com' in url:
+            logger.info("Trying Facebook HTML scraping...")
+            image_files, description = await scrape_facebook_images(url, temp_dir)
+
+        # For Instagram, try HTML scraping
+        elif 'instagram.com' in url:
+            logger.info("Trying Instagram HTML scraping...")
+            image_files, description = await scrape_instagram_images(url, temp_dir)
+
+        if not image_files:
+            # No images found - might be a video post, try yt-dlp
+            logger.info(f"No images found for {url}, trying video download")
+            await status_msg.edit_text("📹 No images found. Trying video download...")
+            await cleanup_directory(temp_dir)
+            await download_and_send(message, url, 'video')
+            return
+
+        await status_msg.edit_text(f"📤 Sending {len(image_files)} image(s)...")
+
+        # Filter only image files
+        valid_images = [f for f in image_files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+
+        if not valid_images:
+            # No valid images - might be a video post, try yt-dlp
+            logger.info(f"No valid images for {url}, trying video download")
+            await status_msg.edit_text("📹 No images found. Trying video download...")
+            await cleanup_directory(temp_dir)
+            await download_and_send(message, url, 'video')
+            return
+
+        # Send images
+        if len(valid_images) == 1:
+            # Single image
+            async with aiofiles.open(valid_images[0], 'rb') as f:
+                image_data = await f.read()
+                photo_input = BufferedInputFile(image_data, filename="image.jpg")
+                await message.answer_photo(
+                    photo_input,
+                    caption=description if description else None
+                )
+        else:
+            # Multiple images - use media group (max 10 images per Telegram limitation)
+            media_group = []
+            for idx, img_path in enumerate(valid_images[:10]):  # Telegram max 10 media per group
+                async with aiofiles.open(img_path, 'rb') as f:
+                    image_data = await f.read()
+                    photo_input = BufferedInputFile(image_data, filename=f"image_{idx}.jpg")
+
+                    # Add caption only to first image
+                    if idx == 0 and description:
+                        media_group.append(InputMediaPhoto(media=photo_input, caption=description))
+                    else:
+                        media_group.append(InputMediaPhoto(media=photo_input))
+
+            await message.answer_media_group(media_group)
+
+            # If more than 10 images, send the rest
+            if len(valid_images) > 10:
+                for idx, img_path in enumerate(valid_images[10:], start=10):
+                    async with aiofiles.open(img_path, 'rb') as f:
+                        image_data = await f.read()
+                        photo_input = BufferedInputFile(image_data, filename=f"image_{idx}.jpg")
+                        await message.answer_photo(photo_input)
+
+        await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Image download error: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ Error downloading images: {str(e)[:100]}")
+
+    finally:
+        # Cleanup temp directory
+        if temp_dir:
+            await cleanup_directory(temp_dir)
 
 async def download_and_send(message: types.Message, url: str, format_type: str):
     status_msg = await message.answer("⏳ Downloading...")
