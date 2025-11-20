@@ -96,10 +96,9 @@ def get_ydl_opts(url='', format_type='video'):
             }],
         })
     elif is_youtube and format_type == 'video':
-        # iOS client provides different formats, use simple selection
-        base_opts.update({
-            'format': 'best[ext=mp4]/best',
-        })
+        # iOS client provides different formats, let yt-dlp choose best
+        # Don't specify format to avoid compatibility issues
+        pass
     elif is_reddit:
         # Reddit needs more flexible format - video and audio are separate
         base_opts.update({
