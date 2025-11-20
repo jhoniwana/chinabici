@@ -59,17 +59,22 @@ def get_ydl_opts(url='', format_type='video'):
 
     base_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
+        'quiet': False,  # Enable verbose output to debug cookies
+        'no_warnings': False,
         'socket_timeout': 30,
         'retries': 3,
+        'verbose': True,  # More verbose logging
     }
 
     # Add cookies if available (for YouTube bot detection bypass)
-    cookies_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+    # Use absolute path for cookies
+    cookies_path = '/app/cookies.txt'
     if os.path.exists(cookies_path):
         base_opts['cookiefile'] = cookies_path
-        logger.info("Using cookies for YouTube authentication")
+        logger.info(f"Using cookies from: {cookies_path}")
+        logger.info(f"Cookie file size: {os.path.getsize(cookies_path)} bytes")
+    else:
+        logger.warning(f"Cookies file not found at: {cookies_path}")
 
     if is_youtube and format_type == 'audio':
         base_opts.update({
