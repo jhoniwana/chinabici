@@ -698,7 +698,8 @@ async def handle_mp3(callback: types.CallbackQuery):
         await callback.message.edit_text("❌ Link expired. Please send the URL again.")
         return
 
-    await callback.message.edit_text("⏳ Downloading MP3...")
+    # Delete the selection message - download_and_send will create its own status
+    await callback.message.delete()
     await download_and_send(callback.message, url, 'audio')
 
     if url_hash in pending_downloads:
@@ -714,7 +715,8 @@ async def handle_mp4(callback: types.CallbackQuery):
         await callback.message.edit_text("❌ Link expired. Please send the URL again.")
         return
 
-    await callback.message.edit_text("⏳ Downloading MP4...")
+    # Delete the selection message - download_and_send will create its own status
+    await callback.message.delete()
     await download_and_send(callback.message, url, 'video')
 
     if url_hash in pending_downloads:
