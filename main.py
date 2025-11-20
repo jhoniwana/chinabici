@@ -162,13 +162,23 @@ async def scrape_facebook_images(url: str, temp_dir: str):
             if chromium_path:
                 chrome_options.binary_location = chromium_path
 
-            # Use system chromedriver
-            chromedriver_path = shutil.which('chromedriver') or '/usr/sbin/chromedriver'
+            # Use system chromedriver - check multiple possible locations
+            chromedriver_path = shutil.which('chromedriver')
+            if not chromedriver_path:
+                # Try common locations for different OS (Ubuntu/Debian vs Arch)
+                for path in ['/usr/bin/chromedriver', '/usr/sbin/chromedriver', '/usr/local/bin/chromedriver']:
+                    if os.path.exists(path):
+                        chromedriver_path = path
+                        break
+
+            if not chromedriver_path:
+                raise FileNotFoundError("chromedriver not found in system")
 
             driver = None
             try:
                 service = Service(chromedriver_path)
                 driver = webdriver.Chrome(service=service, options=chrome_options)
+                logger.info(f"Using ChromeDriver at: {chromedriver_path}")
                 driver.set_page_load_timeout(40)
 
                 logger.info(f"Loading Facebook page with Selenium: {url}")
