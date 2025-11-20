@@ -59,22 +59,21 @@ def get_ydl_opts(url='', format_type='video'):
 
     base_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
-        'quiet': False,  # Enable verbose output to debug cookies
-        'no_warnings': False,
+        'quiet': True,
+        'no_warnings': True,
         'socket_timeout': 30,
         'retries': 3,
-        'verbose': True,  # More verbose logging
     }
 
-    # Add cookies if available (for YouTube bot detection bypass)
-    # Use absolute path for cookies
-    cookies_path = '/app/cookies.txt'
-    if os.path.exists(cookies_path):
-        base_opts['cookiefile'] = cookies_path
-        logger.info(f"Using cookies from: {cookies_path}")
-        logger.info(f"Cookie file size: {os.path.getsize(cookies_path)} bytes")
-    else:
-        logger.warning(f"Cookies file not found at: {cookies_path}")
+    # Add extractor args to help bypass YouTube bot detection
+    if is_youtube:
+        base_opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'player_skip': ['webpage', 'configs'],
+            }
+        }
+        logger.info("Using YouTube extractor with Android client")
 
     if is_youtube and format_type == 'audio':
         base_opts.update({
