@@ -22,4 +22,3 @@ env/
 bot.py.old
 .claude/
 get-docker.sh
-cookies.txt
