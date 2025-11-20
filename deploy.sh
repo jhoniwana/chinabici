@@ -35,11 +35,19 @@ fi
 
 echo "✓ Verificaciones completadas"
 echo ""
-echo "📦 Construyendo imagen Docker..."
-docker-compose build
+echo "🔄 Deteniendo contenedor anterior..."
+docker-compose down
 
 echo ""
-echo "🔄 Iniciando contenedor..."
+echo "🧹 Limpiando caché de Docker..."
+docker system prune -f
+
+echo ""
+echo "📦 Construyendo imagen Docker (sin caché)..."
+docker-compose build --no-cache
+
+echo ""
+echo "🚀 Iniciando contenedor..."
 docker-compose up -d
 
 echo ""
