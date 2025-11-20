@@ -65,6 +65,12 @@ def get_ydl_opts(url='', format_type='video'):
         'retries': 3,
     }
 
+    # Add cookies if available (for YouTube bot detection bypass)
+    cookies_path = '/app/cookies.txt'
+    if os.path.exists(cookies_path):
+        base_opts['cookiefile'] = cookies_path
+        logger.info(f"Using cookies from: {cookies_path}")
+
     # Add extractor args to help bypass YouTube bot detection
     if is_youtube:
         base_opts['extractor_args'] = {
@@ -78,7 +84,7 @@ def get_ydl_opts(url='', format_type='video'):
             'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
             'Accept-Language': 'en-US,en;q=0.9',
         }
-        logger.info("Using YouTube extractor with iOS client")
+        logger.info("Using YouTube extractor with iOS client + cookies")
 
     if is_youtube and format_type == 'audio':
         base_opts.update({
