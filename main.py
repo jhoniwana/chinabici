@@ -69,24 +69,9 @@ def get_ydl_opts(url='', format_type='video'):
     cookies_path = '/app/cookies.txt'
     if os.path.exists(cookies_path):
         base_opts['cookiefile'] = cookies_path
-        logger.info(f"Using cookies from: {cookies_path}")
-        # NOTE: iOS client doesn't work with cookies (YouTube blocks it)
-        # When using cookies, use default web client or android
-        if is_youtube:
-            base_opts['extractor_args'] = {
-                'youtube': {
-                    'player_client': ['android', 'web'],
-                }
-            }
-            logger.info("Using YouTube extractor with Android client + cookies")
-    elif is_youtube:
-        # Without cookies, iOS client works better
-        base_opts['extractor_args'] = {
-            'youtube': {
-                'player_client': ['ios'],
-            }
-        }
-        logger.info("Using YouTube extractor with iOS client (no cookies)")
+        logger.info(f"Using cookies for YouTube authentication")
+        # Don't specify player_client when using cookies
+        # Let yt-dlp use its default: tv_downgraded,web_safari,web
 
     if is_youtube and format_type == 'audio':
         base_opts.update({
