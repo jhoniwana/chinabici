@@ -65,6 +65,12 @@ def get_ydl_opts(url='', format_type='video'):
         'retries': 3,
     }
 
+    # Add cookies if available (for YouTube bot detection bypass)
+    cookies_path = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+    if os.path.exists(cookies_path):
+        base_opts['cookiefile'] = cookies_path
+        logger.info("Using cookies for YouTube authentication")
+
     if is_youtube and format_type == 'audio':
         base_opts.update({
             'format': 'bestaudio/best',

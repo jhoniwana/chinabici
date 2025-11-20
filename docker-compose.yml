@@ -8,6 +8,7 @@ services:
     volumes:
       - ./downloads:/app/downloads
       - ./logs:/app/logs
+      - ./cookies.txt:/app/cookies.txt:ro  # Mount cookies if available
     environment:
       - TZ=America/New_York
     logging:

@@ -199,6 +199,12 @@ docker-compose restart
 
 **Large file send failures:** Telegram has 2GB limit - already handled by sending as document vs video based on 50MB threshold
 
+**YouTube bot detection on VPS:** VPS IPs are often flagged by YouTube
+- Export cookies from your browser using "Get cookies.txt LOCALLY" extension
+- Save as `cookies.txt` in project root
+- The bot will automatically use cookies if the file exists
+- Restart container: `docker-compose restart`
+
 **Instagram/Facebook images not loading:** Selenium may fail on heavily protected pages
 - Check if Chromium is installed: `which chromium`
 - Verify Chrome options in `get_page_source_with_selenium()`
