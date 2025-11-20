@@ -14,6 +14,13 @@ import tempfile
 import shutil
 from bs4 import BeautifulSoup
 import aiohttp
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -35,9 +42,20 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 pending_downloads = {}
+# Store original message info for delete button
+original_messages = {}
+
+async def delete_message_after_delay(message: types.Message, delay: int = 5):
+    """Delete a message after specified delay in seconds"""
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Failed to delete message: {e}")
 
 def get_ydl_opts(url='', format_type='video'):
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
+    is_reddit = 'reddit.com' in url or 'redd.it' in url
 
     base_opts = {
         'outtmpl': 'downloads/%(id)s.%(ext)s',
@@ -64,6 +82,12 @@ def get_ydl_opts(url='', format_type='video'):
                 'key': 'FFmpegVideoConvertor',
                 'preferedformat': 'mp4',
             }],
+        })
+    elif is_reddit:
+        # Reddit needs more flexible format - video and audio are separate
+        base_opts.update({
+            'format': 'bestvideo+bestaudio/best',
+            'merge_output_format': 'mp4',
         })
     else:
         base_opts['format'] = 'best[ext=mp4]/best'
@@ -122,67 +146,165 @@ async def extract_images_info(url: str):
         return None
 
 async def scrape_facebook_images(url: str, temp_dir: str):
-    """Scrape images directly from Facebook HTML (fallback method)"""
+    """Scrape images from Facebook using Selenium to get full description"""
     try:
-        # Use curl via subprocess since aiohttp is being blocked by Facebook
-        import subprocess
+        def selenium_scrape():
+            chrome_options = Options()
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_argument('user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36')
 
-        curl_command = [
-            'curl', '-L', '-A',
-            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-            url
-        ]
+            # Use system chromium
+            chromium_path = shutil.which('chromium')
+            if chromium_path:
+                chrome_options.binary_location = chromium_path
 
-        result = await asyncio.to_thread(
-            subprocess.run,
-            curl_command,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+            # Use system chromedriver
+            chromedriver_path = shutil.which('chromedriver') or '/usr/sbin/chromedriver'
 
-        if result.returncode != 0:
-            logger.error(f"curl failed with return code: {result.returncode}")
+            driver = None
+            try:
+                service = Service(chromedriver_path)
+                driver = webdriver.Chrome(service=service, options=chrome_options)
+                driver.set_page_load_timeout(40)
+
+                logger.info(f"Loading Facebook page with Selenium: {url}")
+                driver.get(url)
+
+                # Wait for the body to be present
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                time.sleep(3)
+
+                # Try to close login popups
+                close_selectors = [
+                    '[aria-label="Close"]',
+                    '[aria-label="Cerrar"]',
+                    'div[role="button"][aria-label="Close"]'
+                ]
+                for selector in close_selectors:
+                    try:
+                        close_btn = driver.find_element(By.CSS_SELECTOR, selector)
+                        close_btn.click()
+                        time.sleep(1)
+                        logger.info(f"Closed popup with: {selector}")
+                        break
+                    except:
+                        pass
+
+                # Click "Ver más" / "See more" button to expand description
+                see_more_selectors = [
+                    'div[role="button"]:not([aria-label])',  # Generic button divs
+                    '[role="button"]'
+                ]
+
+                # Try multiple approaches to find "Ver más" or "See more"
+                see_more_clicked = False
+                try:
+                    # Find all role="button" elements and look for text content
+                    buttons = driver.find_elements(By.CSS_SELECTOR, 'div[role="button"]')
+                    for btn in buttons:
+                        btn_text = btn.text.lower().strip()
+                        if btn_text in ['ver más', 'see more', 'más', 'more']:
+                            try:
+                                btn.click()
+                                see_more_clicked = True
+                                logger.info(f"Clicked 'Ver más' button")
+                                time.sleep(2)
+                                break
+                            except:
+                                pass
+                except Exception as e:
+                    logger.debug(f"See more click attempt failed: {e}")
+
+                # Get full page source after clicking
+                html = driver.page_source
+                return html
+
+            finally:
+                if driver:
+                    driver.quit()
+
+        html = await asyncio.to_thread(selenium_scrape)
+
+        if not html:
+            logger.error("Failed to get page source from Selenium")
             return [], None
 
-        html = result.stdout
-        logger.info(f"Fetched {len(html)} bytes of HTML via curl")
+        logger.info(f"Fetched {len(html)} bytes of HTML via Selenium")
 
         soup = BeautifulSoup(html, 'lxml')
 
-        # Find images and description from Open Graph meta tags
+        # Find images and description
         images = []
         description = None
 
-        # Extract description from og:description
-        og_description = soup.find('meta', property='og:description')
-        if og_description and og_description.get('content'):
-            description = og_description['content']
-            logger.info(f"Found description: {description[:100]}")
+        # Try to get full description from the page content
+        # Look for the post text container
+        post_text_selectors = [
+            'div[data-ad-preview="message"]',
+            'div[data-ad-comet-preview="message"]',
+            'div[dir="auto"]'
+        ]
+
+        for selector in post_text_selectors:
+            text_divs = soup.select(selector)
+            for div in text_divs:
+                text = div.get_text(strip=True)
+                if text and len(text) > 50:  # Likely the main post text
+                    if not description or len(text) > len(description):
+                        description = text
+                        break
+            if description and len(description) > 100:
+                break
+
+        # Fallback to og:description if no better text found
+        if not description or len(description) < 50:
+            og_description = soup.find('meta', property='og:description')
+            if og_description and og_description.get('content'):
+                fallback_desc = og_description['content']
+                if not description or len(fallback_desc) > len(description):
+                    description = fallback_desc
+
+        if description:
+            logger.info(f"Found description ({len(description)} chars): {description[:100]}...")
 
         # Extract image URLs from og:image meta tags
         og_images = soup.find_all('meta', property='og:image')
 
         if not og_images:
-            logger.info("No og:image tags found")
-            return [], None
+            # Try to find images in the page content
+            img_tags = soup.find_all('img')
+            for img in img_tags:
+                src = img.get('src', '')
+                if 'fbcdn.net' in src and 'emoji' not in src:
+                    og_images.append({'content': src})
 
-        for idx, og_img in enumerate(og_images):
-            img_url = og_img.get('content')
+        if not og_images:
+            logger.info("No images found")
+            return [], description
 
-            if img_url and 'fbcdn.net' in img_url:
-                # Unescape HTML entities in the URL
+        # Download images
+        import subprocess
+        for idx, og_img in enumerate(og_images[:10]):  # Limit to 10 images
+            img_url = og_img.get('content') if isinstance(og_img, dict) else og_img.get('content')
+
+            if not img_url:
+                continue
+
+            if 'fbcdn.net' in img_url:
                 img_url = img_url.replace('&amp;', '&')
 
-                # Download the image using curl
                 try:
-                    import subprocess
-
                     img_filename = os.path.join(temp_dir, f"facebook_image_{idx}.jpg")
 
                     curl_img_command = [
                         'curl', '-L', '-o', img_filename,
-                        '-A', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+                        '-A', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
                         img_url
                     ]
 
@@ -194,18 +316,19 @@ async def scrape_facebook_images(url: str, temp_dir: str):
                     )
 
                     if img_result.returncode == 0 and os.path.exists(img_filename):
-                        images.append(img_filename)
-                        logger.info(f"Downloaded Facebook image {idx+1} from og:image: {img_filename}")
-                    else:
-                        logger.error(f"Failed to download image {idx}")
+                        # Check file size to filter out tiny images
+                        if os.path.getsize(img_filename) > 5000:
+                            images.append(img_filename)
+                            logger.info(f"Downloaded Facebook image {idx+1}: {img_filename}")
+                        else:
+                            os.remove(img_filename)
                 except Exception as e:
                     logger.error(f"Failed to download image {idx}: {e}")
-                    continue
 
         return images, description
 
     except Exception as e:
-        logger.error(f"Facebook scraping error: {e}")
+        logger.error(f"Facebook scraping error: {e}", exc_info=True)
         return [], None
 
 async def scrape_instagram_images(url: str, temp_dir: str):
@@ -400,9 +523,11 @@ async def download_and_send_images(message: types.Message, url: str):
         if not image_files:
             # No images found - might be a video post, try yt-dlp
             logger.info(f"No images found for {url}, trying video download")
-            await status_msg.edit_text("📹 No images found. Trying video download...")
+            info_msg = await status_msg.edit_text("📹 No images found. Trying video download...")
+            # Auto-delete info message after 5 seconds
+            asyncio.create_task(delete_message_after_delay(info_msg, 5))
             await cleanup_directory(temp_dir)
-            await download_and_send(message, url, 'video')
+            await download_and_send(message, url, 'video', original_msg_id=message.message_id)
             return
 
         await status_msg.edit_text(f"📤 Sending {len(image_files)} image(s)...")
@@ -413,10 +538,23 @@ async def download_and_send_images(message: types.Message, url: str):
         if not valid_images:
             # No valid images - might be a video post, try yt-dlp
             logger.info(f"No valid images for {url}, trying video download")
-            await status_msg.edit_text("📹 No images found. Trying video download...")
+            info_msg = await status_msg.edit_text("📹 No images found. Trying video download...")
+            # Auto-delete info message after 5 seconds
+            asyncio.create_task(delete_message_after_delay(info_msg, 5))
             await cleanup_directory(temp_dir)
-            await download_and_send(message, url, 'video')
+            await download_and_send(message, url, 'video', original_msg_id=message.message_id)
             return
+
+        # Create delete button for original message
+        import hashlib
+        delete_hash = hashlib.md5(f"{message.chat.id}:{message.message_id}".encode()).hexdigest()[:8]
+        original_messages[delete_hash] = {
+            'chat_id': message.chat.id,
+            'message_id': message.message_id
+        }
+        delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Delete original message", callback_data=f"del_orig:{delete_hash}")]
+        ])
 
         # Send images
         if len(valid_images) == 1:
@@ -426,7 +564,8 @@ async def download_and_send_images(message: types.Message, url: str):
                 photo_input = BufferedInputFile(image_data, filename="image.jpg")
                 await message.answer_photo(
                     photo_input,
-                    caption=description if description else None
+                    caption=description if description else None,
+                    reply_markup=delete_keyboard
                 )
         else:
             # Multiple images - use media group (max 10 images per Telegram limitation)
@@ -452,18 +591,23 @@ async def download_and_send_images(message: types.Message, url: str):
                         photo_input = BufferedInputFile(image_data, filename=f"image_{idx}.jpg")
                         await message.answer_photo(photo_input)
 
+            # Send delete button as separate message for media groups
+            await message.answer("✅ Images downloaded", reply_markup=delete_keyboard)
+
         await status_msg.delete()
 
     except Exception as e:
         logger.error(f"Image download error: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Error downloading images: {str(e)[:100]}")
+        error_msg = await status_msg.edit_text(f"❌ Error downloading images: {str(e)[:100]}")
+        # Auto-delete error message after 5 seconds
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
 
     finally:
         # Cleanup temp directory
         if temp_dir:
             await cleanup_directory(temp_dir)
 
-async def download_and_send(message: types.Message, url: str, format_type: str):
+async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None):
     status_msg = await message.answer("⏳ Downloading...")
 
     try:
@@ -490,25 +634,40 @@ async def download_and_send(message: types.Message, url: str, format_type: str):
             async with aiofiles.open(filename, 'rb') as f:
                 file_data = await f.read()
 
+                # Create delete button for original message
+                import hashlib
+                delete_hash = hashlib.md5(f"{message.chat.id}:{original_msg_id or message.message_id}".encode()).hexdigest()[:8]
+                original_messages[delete_hash] = {
+                    'chat_id': message.chat.id,
+                    'message_id': original_msg_id or message.message_id
+                }
+
+                delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🗑️ Delete original message", callback_data=f"del_orig:{delete_hash}")]
+                ])
+
                 if format_type == 'audio':
                     audio_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp3")
                     await message.answer_audio(
                         audio_input,
                         caption=f"**{title[:100]}**",
-                        title=title[:100]
+                        title=title[:100],
+                        reply_markup=delete_keyboard
                     )
                 else:
                     video_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp4")
                     if filesize > 50 * 1024 * 1024:
                         await message.answer_document(
                             video_input,
-                            caption=f"**{title[:100]}**"
+                            caption=f"**{title[:100]}**",
+                            reply_markup=delete_keyboard
                         )
                     else:
                         await message.answer_video(
                             video_input,
                             caption=f"**{title[:100]}**",
-                            supports_streaming=True
+                            supports_streaming=True,
+                            reply_markup=delete_keyboard
                         )
 
             await status_msg.delete()
@@ -516,14 +675,18 @@ async def download_and_send(message: types.Message, url: str, format_type: str):
 
     except yt_dlp.utils.DownloadError as e:
         logger.error(f"Download error: {e}")
-        await status_msg.edit_text(
+        error_msg = await status_msg.edit_text(
             f"❌ Download failed\n\n"
             f"The video might be private or unavailable."
         )
+        # Auto-delete error message after 5 seconds
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        # Auto-delete error message after 5 seconds
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
 
 @dp.callback_query(F.data.startswith("mp3:"))
 async def handle_mp3(callback: types.CallbackQuery):
@@ -556,6 +719,31 @@ async def handle_mp4(callback: types.CallbackQuery):
 
     if url_hash in pending_downloads:
         del pending_downloads[url_hash]
+
+@dp.callback_query(F.data.startswith("del_orig:"))
+async def handle_delete_original(callback: types.CallbackQuery):
+    """Handle delete original message button"""
+    await callback.answer()
+    delete_hash = callback.data.split(":", 1)[1]
+    msg_info = original_messages.get(delete_hash)
+
+    if not msg_info:
+        await callback.answer("Message info expired", show_alert=True)
+        return
+
+    try:
+        # Delete the original message
+        await bot.delete_message(msg_info['chat_id'], msg_info['message_id'])
+        # Remove the delete button from the media message
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Original message deleted!")
+    except Exception as e:
+        logger.error(f"Failed to delete original message: {e}")
+        await callback.answer("Could not delete message", show_alert=True)
+
+    # Clean up
+    if delete_hash in original_messages:
+        del original_messages[delete_hash]
 
 async def main():
     try:
