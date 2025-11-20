@@ -81,13 +81,10 @@ def get_ydl_opts(url='', format_type='video'):
             }],
         })
     elif is_youtube and format_type == 'video':
+        # More flexible format selection with multiple fallbacks
         base_opts.update({
-            'format': 'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best',
             'merge_output_format': 'mp4',
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
         })
     elif is_reddit:
         # Reddit needs more flexible format - video and audio are separate
