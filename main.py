@@ -75,14 +75,8 @@ def get_ydl_opts(url='', format_type='video'):
     if is_youtube:
         base_opts['extractor_args'] = {
             'youtube': {
-                'player_client': ['ios', 'android'],
-                'skip': ['hls', 'dash'],
+                'player_client': ['ios'],
             }
-        }
-        # Add headers to mimic real browser
-        base_opts['http_headers'] = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-            'Accept-Language': 'en-US,en;q=0.9',
         }
         logger.info("Using YouTube extractor with iOS client + cookies")
 
