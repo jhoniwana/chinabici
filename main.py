@@ -123,7 +123,7 @@ def is_facebook_video(url: str) -> bool:
     """Check if URL is a Facebook video (reel, watch, video post)"""
     if not is_facebook(url):
         return False
-    video_patterns = ['/reel/', '/watch/', '/videos/', '/video.php', 'story_fbid=', '/ reels/']
+    video_patterns = ['/reel/', '/watch/', '/videos/', '/video.php', 'story_fbid=', '/share/r/', '/share/v/']
     return any(pattern in url for pattern in video_patterns)
 
 def is_twitter(url: str) -> bool:
