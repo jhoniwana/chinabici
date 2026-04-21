@@ -115,9 +115,37 @@ async def cleanup_directory(dirpath: str):
 def is_youtube(url: str) -> bool:
     return 'youtube.com' in url or 'youtu.be' in url
 
+def is_facebook(url: str) -> bool:
+    """Check if URL is from Facebook"""
+    return 'facebook.com' in url
+
+def is_facebook_video(url: str) -> bool:
+    """Check if URL is a Facebook video (reel, watch, video post)"""
+    if not is_facebook(url):
+        return False
+    video_patterns = ['/reel/', '/watch/', '/videos/', '/video.php', 'story_fbid=', '/ reels/']
+    return any(pattern in url for pattern in video_patterns)
+
+def is_twitter(url: str) -> bool:
+    """Check if URL is from Twitter/X"""
+    return 'twitter.com' in url or 'x.com' in url or 't.co' in url
+
+def is_reddit(url: str) -> bool:
+    """Check if URL is from Reddit"""
+    return 'reddit.com' in url or 'redd.it' in url
+
+def is_tiktok(url: str) -> bool:
+    """Check if URL is from TikTok"""
+    return 'tiktok.com' in url or 'vm.tiktok' in url
+
 def is_image_platform(url: str) -> bool:
-    """Check if URL is from a platform that might have images"""
-    return 'instagram.com' in url or 'facebook.com' in url
+    """Check if URL is from a platform that has images (posts, not videos)"""
+    # Facebook posts (not reels) and Instagram posts
+    if 'instagram.com' in url and '/reel/' not in url and '/stories/' not in url and '/story/' not in url:
+        return True
+    if 'facebook.com' in url and not is_facebook_video(url):
+        return True
+    return False
 
 def is_instagram_reel(url: str) -> bool:
     """Check if URL is an Instagram reel (video)"""
@@ -499,15 +527,37 @@ async def handle_url(message: types.Message):
             "**YouTube detected!**\n\nChoose format:",
             reply_markup=keyboard
         )
+    elif is_facebook_video(url):
+        # Facebook videos (reels, watch, video posts) - download as video
+        logger.info(f"Facebook video detected: {url}")
+        await message.answer("📹 Facebook video detected! Downloading...")
+        await download_and_send(message, url, 'video')
+    elif is_tiktok(url):
+        # TikTok videos
+        logger.info(f"TikTok detected: {url}")
+        await message.answer("🎵 TikTok detected! Downloading...")
+        await download_and_send(message, url, 'video')
+    elif is_reddit(url):
+        # Reddit videos and galleries
+        logger.info(f"Reddit detected: {url}")
+        await message.answer("🤖 Reddit detected! Downloading...")
+        await download_and_send(message, url, 'video')
+    elif is_twitter(url):
+        # Twitter/X videos and images
+        logger.info(f"Twitter/X detected: {url}")
+        await message.answer("🐦 Twitter/X detected! Downloading...")
+        await download_and_send(message, url, 'video')
     elif is_instagram_reel(url) or is_instagram_story(url):
         # Instagram reels and stories are videos - skip image detection
         logger.info(f"Instagram video detected (reel/story): {url}")
         await download_and_send(message, url, 'video')
     elif is_image_platform(url):
-        # For Instagram posts and Facebook, try images first
+        # For Instagram posts and Facebook posts, try images first
         # If it fails or has no images, it will fall back to video
         await download_and_send_images(message, url)
     else:
+        # Generic video download for other platforms (1000+ sites)
+        logger.info(f"Generic video download: {url}")
         await download_and_send(message, url, 'video')
 
 async def download_and_send_images(message: types.Message, url: str):
