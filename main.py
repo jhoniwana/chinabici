@@ -166,19 +166,18 @@ async def download_via_cobalt(url: str, output_dir: str = "downloads") -> str | 
         async with aiohttp.ClientSession() as session:
             payload = {
                 "url": url,
-                "videoQuality": "720",
-                "audioFormat": "mp3",
                 "downloadMode": "auto",
-            }
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
+                "vcodec": "h264",
+                "acodec": "mp3",
             }
 
             async with session.post(
                 f"{COBALT_URL}/",
                 json=payload,
-                headers=headers,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                },
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as resp:
                 if resp.status != 200:
