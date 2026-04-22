@@ -653,24 +653,26 @@ async def download_and_send_images(message: types.Message, url: str):
         description = ""
         image_files = []
 
-        # For Facebook, try HTML scraping first, fallback to cobalt
+        # For Facebook, try cobalt first (more reliable than Selenium)
         if 'facebook.com' in url:
-            logger.info("Trying Facebook HTML scraping...")
-            image_files, description = await scrape_facebook_images(url, temp_dir)
+            logger.info("Trying cobalt for Facebook...")
+            await status_msg.edit_text("⏳ Downloading via cobalt...")
+            cobalt_file = await download_via_cobalt(url, temp_dir)
 
-            if not image_files:
-                logger.info("Facebook scraping failed, trying cobalt...")
-                await status_msg.edit_text("⏳ Trying alternative method...")
-                cobalt_file = await download_via_cobalt(url, temp_dir)
-                if cobalt_file and cobalt_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                    image_files = [cobalt_file]
-                    description = "Downloaded via cobalt"
-                elif cobalt_file:
-                    # It's a video, download normally
-                    await status_msg.edit_text("📹 Found video, downloading...")
-                    await cleanup_directory(temp_dir)
-                    await download_and_send(message, url, 'video', original_msg_id=message.message_id)
-                    return
+            # Check if cobalt returned an image or video
+            if cobalt_file and cobalt_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                image_files = [cobalt_file]
+                description = "Downloaded via cobalt"
+            elif cobalt_file:
+                # It's a video, download normally
+                await status_msg.edit_text("📹 Found video, downloading...")
+                await cleanup_directory(temp_dir)
+                await download_and_send(message, url, 'video', original_msg_id=message.message_id)
+                return
+            else:
+                # Fallback to Selenium
+                logger.info("Cobalt failed, trying Facebook HTML scraping...")
+                image_files, description = await scrape_facebook_images(url, temp_dir)
 
         # For Instagram, try HTML scraping
         elif 'instagram.com' in url:
