@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile
 import yt_dlp
 import aiofiles
 from gallery_dl import config as gdl_config, job as gdl_job
@@ -24,6 +24,7 @@ import time
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+COBALT_URL = os.getenv("COBALT_URL", "http://cobalt-api:9000")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -121,9 +122,11 @@ def is_facebook(url: str) -> bool:
 
 def is_facebook_video(url: str) -> bool:
     """Check if URL is a Facebook video (reel, watch, video post)"""
+    if 'fb.watch' in url:
+        return True
     if not is_facebook(url):
         return False
-    video_patterns = ['/reel/', '/watch/', '/videos/', '/video.php', 'story_fbid=', '/share/r/', '/share/v/']
+    video_patterns = ['/reel/', '/watch', '/videos/', '/video.php', 'story_fbid=', '/share/r/', '/share/v/']
     return any(pattern in url for pattern in video_patterns)
 
 def is_twitter(url: str) -> bool:
@@ -154,6 +157,84 @@ def is_instagram_reel(url: str) -> bool:
 def is_instagram_story(url: str) -> bool:
     """Check if URL is an Instagram story"""
     return 'instagram.com' in url and ('/stories/' in url or '/story/' in url)
+
+async def download_via_cobalt(url: str, output_dir: str = "downloads") -> str | None:
+    """Download a video using cobalt-api (internal Docker service)."""
+    try:
+        logger.info(f"Trying cobalt for: {url}")
+
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "url": url,
+                "videoQuality": "720",
+                "audioFormat": "mp3",
+                "downloadMode": "auto",
+            }
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+
+            async with session.post(
+                f"{COBALT_URL}/",
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Cobalt responded HTTP {resp.status}")
+                    return None
+
+                data = await resp.json()
+
+        status = data.get("status")
+
+        if status == "error":
+            error_code = data.get("error", {}).get("code", "unknown")
+            logger.error(f"Cobalt error: {error_code}")
+            return None
+
+        if status not in ("redirect", "tunnel", "stream"):
+            logger.error(f"Cobalt unexpected status: {status}")
+            return None
+
+        download_url = data.get("url")
+        filename_hint = data.get("filename", "cobalt_video.mp4")
+
+        if not download_url:
+            logger.error("Cobalt returned no download URL")
+            return None
+
+        output_path = os.path.join(output_dir, filename_hint)
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                download_url,
+                timeout=aiohttp.ClientTimeout(total=120)
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Error downloading from cobalt URL: {resp.status}")
+                    return None
+
+                async with aiofiles.open(output_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        await f.write(chunk)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(f"Cobalt downloaded: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return output_path
+
+        return None
+
+    except aiohttp.ClientConnectorError:
+        logger.error("Could not connect to cobalt-api. Is the service running?")
+        return None
+    except asyncio.TimeoutError:
+        logger.error("Timeout connecting to cobalt-api")
+        return None
+    except Exception as e:
+        logger.error(f"Error in cobalt: {e}", exc_info=True)
+        return None
 
 async def extract_images_info(url: str):
     """Extract image information using gallery-dl"""
@@ -572,10 +653,24 @@ async def download_and_send_images(message: types.Message, url: str):
         description = ""
         image_files = []
 
-        # For Facebook, try HTML scraping
+        # For Facebook, try HTML scraping first, fallback to cobalt
         if 'facebook.com' in url:
             logger.info("Trying Facebook HTML scraping...")
             image_files, description = await scrape_facebook_images(url, temp_dir)
+
+            if not image_files:
+                logger.info("Facebook scraping failed, trying cobalt...")
+                await status_msg.edit_text("⏳ Trying alternative method...")
+                cobalt_file = await download_via_cobalt(url, temp_dir)
+                if cobalt_file and cobalt_file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    image_files = [cobalt_file]
+                    description = "Downloaded via cobalt"
+                elif cobalt_file:
+                    # It's a video, download normally
+                    await status_msg.edit_text("📹 Found video, downloading...")
+                    await cleanup_directory(temp_dir)
+                    await download_and_send(message, url, 'video', original_msg_id=message.message_id)
+                    return
 
         # For Instagram, try HTML scraping
         elif 'instagram.com' in url:
@@ -736,13 +831,36 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
             await cleanup_file(filename)
 
     except yt_dlp.utils.DownloadError as e:
-        logger.error(f"Download error: {e}")
-        error_msg = await status_msg.edit_text(
-            f"❌ Download failed\n\n"
-            f"The video might be private or unavailable."
-        )
-        # Auto-delete error message after 5 seconds
-        asyncio.create_task(delete_message_after_delay(error_msg, 5))
+        logger.warning(f"yt-dlp failed ({e}), trying cobalt...")
+        await status_msg.edit_text("⏳ Trying alternative method...")
+
+        cobalt_file = await download_via_cobalt(url)
+
+        if cobalt_file:
+            filesize = os.path.getsize(cobalt_file)
+            title = url.split('/')[-1] or "video"
+
+            await status_msg.edit_text("📤 Sending...")
+
+            video_input = FSInputFile(cobalt_file, filename="video.mp4")
+
+            if filesize > 50 * 1024 * 1024:
+                await message.answer_document(video_input, caption="📥 Downloaded via cobalt")
+            else:
+                await message.answer_video(
+                    video_input,
+                    caption="📥 Downloaded via cobalt",
+                    supports_streaming=True
+                )
+
+            await status_msg.delete()
+            await cleanup_file(cobalt_file)
+        else:
+            error_msg = await status_msg.edit_text(
+                "❌ Could not download the video.\n\n"
+                "It may be private or require login."
+            )
+            asyncio.create_task(delete_message_after_delay(error_msg, 5))
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
