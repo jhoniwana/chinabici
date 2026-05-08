@@ -6,6 +6,7 @@ Bot de Telegram para descargar videos de YouTube, Instagram, TikTok, Facebook, T
 
 - 🎵 **YouTube:** Elige entre MP3 (audio) o MP4 (video)
 - 📹 **Otras plataformas:** Descarga automática en mejor calidad
+- 🤖 **Markov:** Generador de frases con `/xd`, mensajes automáticos cada 2 horas, y aprendizaje de mensajes del grupo
 - 🚀 **Rápido:** Descargas optimizadas por plataforma
 - 🐳 **Docker:** Despliega fácilmente en cualquier VPS
 - 🔄 **Auto-limpieza:** Elimina archivos temporales automáticamente
@@ -80,6 +81,31 @@ docker-compose down && docker-compose build && docker-compose up -d
 
 ## 📋 Instalación Local (sin Docker)
 
+### Arch Linux
+
+```bash
+# Actualizar e instalar Python
+sudo pacman -Syu --noconfirm
+sudo pacman -S --noconfirm python python-pip ffmpeg
+
+# Crear entorno virtual
+python -m venv venv
+source venv/bin/activate
+
+# Instalar dependencias
+pip install -U pip
+pip install -r requirements.txt
+
+# Configurar entorno
+cp .env.example .env
+# Edita .env y coloca tu BOT_TOKEN
+
+# Ejecutar
+python main.py
+```
+
+### Debian/Ubuntu
+
 ```bash
 # Instalar dependencias del sistema
 sudo apt install python3 python3-pip ffmpeg -y
@@ -104,6 +130,14 @@ Crea un archivo `.env` con tu token:
 
 ```env
 BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
+
+# Markov (generador de frases)
+MARKOV_ENABLED=true
+MARKOV_CHAT_ID=@tu_grupo_o_chat
+MARKOV_INTERVAL_MINUTES=120
+MARKOV_MODEL_PATH=./model.json
+MARKOV_LEARN_ENABLED=true
+MARKOV_RETRAIN_INTERVAL_HOURS=24
 ```
 
 ### Obtener Token
@@ -114,17 +148,28 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 4. Sigue las instrucciones
 5. Copia el token
 
+### Configurar mensajes automáticos Markov
+
+- `MARKOV_ENABLED=true` — Activa el generador y el envío automático.
+- `MARKOV_CHAT_ID` — Chat o grupo donde se enviarán los mensajes automáticos. Puede ser un ID numérico (`-1001234567890`) o un alias (`@mi_grupo`).
+- `MARKOV_INTERVAL_MINUTES` — Intervalo en minutos entre mensajes automáticos. Por defecto: `120` (2 horas).
+- `MARKOV_MODEL_PATH` — Ruta al modelo entrenado (`model.json`).
+
+> **Nota:** Si `MARKOV_CHAT_ID` está vacío, el bot responderá `/xd` pero no enviará mensajes automáticos. El aprendizaje (`MARKOV_LEARN_ENABLED`) funciona en cualquier chat donde esté el bot.
+
 ## 📁 Estructura del Proyecto
 
 ```
 chinabici/
-├── main.py              # Código principal del bot
-├── Dockerfile           # Imagen Docker
-├── docker-compose.yml   # Orquestación
-├── requirements.txt     # Dependencias Python
-├── deploy.sh            # Script de despliegue
-├── .env                 # Token (crear desde .env.example)
-└── README.md           # Este archivo
+├── main.py                 # Código principal del bot
+├── markov_service.py       # Servicio de generación Markov
+├── model.json              # Modelo Markov entrenado
+├── Dockerfile              # Imagen Docker
+├── docker-compose.yml      # Orquestación
+├── requirements.txt        # Dependencias Python
+├── deploy.sh               # Script de despliegue
+├── .env                    # Token y config (crear desde .env.example)
+└── README.md              # Este archivo
 ```
 
 ## 🎯 Características Técnicas
@@ -136,6 +181,12 @@ chinabici/
 ### Otras Plataformas (auto-descarga)
 - Mejor calidad disponible en MP4
 - Optimización por plataforma
+
+### Markov (`/xd`)
+- **`/xd`** — Genera una frase aleatoria usando el modelo entrenado.
+- **`/xd <semilla>`** — Intenta generar una frase que empiece con la palabra dada (ej: `/xd hola`).
+- **Mensajes automáticos** — El bot envía una frase generada cada 2 horas (configurable) al chat indicado en `MARKOV_CHAT_ID`.
+- **Aprendizaje automático** — El bot guarda los mensajes de texto del grupo (excluyendo comandos y URLs) y reentrena el modelo cada 24 horas automáticamente.
 
 ### Límites
 - Videos < 50MB → Enviados como video

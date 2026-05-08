@@ -1,17 +1,68 @@
 services:
+
   bot:
     build: .
     container_name: chinabici-bot
     restart: unless-stopped
+
     env_file:
       - .env
+
+    environment:
+      - TZ=America/New_York
+      - COBALT_URL=http://cobalt-api:9000
+
     volumes:
       - ./downloads:/app/downloads
       - ./logs:/app/logs
-    environment:
-      - TZ=America/New_York
+      - ./model.json:/app/model.json
+
+    depends_on:
+      - cobalt-api
+
+    networks:
+      - chinabici-net
+
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+  cobalt-api:
+    image: ghcr.io/imputnet/cobalt:10
+    container_name: cobalt-api
+    restart: unless-stopped
+
+    init: true
+    read_only: true
+
+    expose:
+      - "9000"
+
+    environment:
+      - API_URL=http://cobalt-api:9000/
+      - CORS_WILDCARD=1
+
+    labels:
+      - com.centurylinklabs.watchtower.scope=cobalt
+
+    networks:
+      - chinabici-net
+
+  watchtower:
+    image: ghcr.io/containrrr/watchtower
+    container_name: watchtower-cobalt
+    restart: unless-stopped
+
+    command: --cleanup --scope cobalt --interval 900 --include-restarting
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - chinabici-net
+
+networks:
+  chinabici-net:
+    driver: bridge

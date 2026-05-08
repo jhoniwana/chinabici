@@ -22,3 +22,5 @@ env/
 bot.py.old
 .claude/
 get-docker.sh
+model.json
+messages_clean.txt
