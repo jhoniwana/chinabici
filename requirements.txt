@@ -1,5 +1,6 @@
 aiogram==3.15.0
 yt-dlp>=2024.12.06
+instaloader>=4.14
 aiofiles==24.1.0
 python-dotenv==1.0.1
 aiohttp==3.10.11
@@ -8,6 +9,6 @@ beautifulsoup4>=4.12.0
 lxml>=5.0.0
 lxml-html-clean
 brotli>=1.1.0
-selenium>=4.26.0
 facebook-scraper>=0.2.59
 markovify>=0.9.4
+websockets>=12.0

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -12,22 +13,19 @@ import aiofiles
 from gallery_dl import config as gdl_config, job as gdl_job
 import tempfile
 import shutil
-from bs4 import BeautifulSoup
-import aiohttp
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-import time
 import facebook_scraper
+
+from bs4 import BeautifulSoup
+
+import websockets
+import aiohttp
 
 import markov_service
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 COBALT_URL = os.getenv("COBALT_URL", "http://cobalt-api:9000")
+LIGHTPANDA_URL = os.getenv("LIGHTPANDA_URL", "ws://lightpanda:9222")
 
 # Markov configuration
 MARKOV_ENABLED = os.getenv("MARKOV_ENABLED", "false").lower() in ("true", "1", "yes", "on")
@@ -178,6 +176,8 @@ def is_image_platform(url: str) -> bool:
         return True
     if 'facebook.com' in url and not is_facebook_video(url):
         return True
+    if is_reddit(url):
+        return True
     return False
 
 def is_instagram_reel(url: str) -> bool:
@@ -312,107 +312,64 @@ async def extract_images_info(url: str):
         logger.error(f"gallery-dl info extraction error: {e}")
         return None
 
-async def scrape_facebook_images(url: str, temp_dir: str):
-    """Scrape images from Facebook using Selenium to get full description"""
+async def fetch_html_via_lightpanda(url: str) -> str | None:
+    """Get full page HTML from Lightpanda browser via CDP WebSocket"""
     try:
-        def selenium_scrape():
-            chrome_options = Options()
-            chrome_options.add_argument('--headless=new')
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36')
+        async with websockets.connect(LIGHTPANDA_URL, max_size=10_000_000) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}))
+            r = json.loads(await ws.recv())
+            r = json.loads(await ws.recv())
+            target_id = r["result"]["targetId"]
 
-            # Use system chromium
-            chromium_path = shutil.which('chromium')
-            if chromium_path:
-                chrome_options.binary_location = chromium_path
+            await ws.send(json.dumps({"id": 2, "method": "Target.attachToTarget", "params": {"targetId": target_id}}))
+            r = json.loads(await ws.recv())
+            session_id = r["params"]["sessionId"]
+            r = json.loads(await ws.recv())
 
-            # Use system chromedriver - check multiple possible locations
-            chromedriver_path = shutil.which('chromedriver')
-            if not chromedriver_path:
-                # Try common locations for different OS (Ubuntu/Debian vs Arch)
-                for path in ['/usr/bin/chromedriver', '/usr/sbin/chromedriver', '/usr/local/bin/chromedriver']:
-                    if os.path.exists(path):
-                        chromedriver_path = path
-                        break
+            logger.info(f"Lightpanda navigating to: {url}")
+            await ws.send(json.dumps({
+                "id": 3, "sessionId": session_id,
+                "method": "Page.navigate", "params": {"url": url}
+            }))
 
-            if not chromedriver_path:
-                raise FileNotFoundError("chromedriver not found in system")
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=20))
+                if r.get("method") in ("Page.frameStoppedLoading", "Page.loadEventFired"):
+                    logger.info(f"Lightpanda {r['method']}")
+                    break
+                elif r.get("method") == "Page.frameNavigated":
+                    logger.info("Lightpanda frame navigated")
 
-            driver = None
-            try:
-                service = Service(chromedriver_path)
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-                logger.info(f"Using ChromeDriver at: {chromedriver_path}")
-                driver.set_page_load_timeout(40)
+            await asyncio.sleep(3)
 
-                logger.info(f"Loading Facebook page with Selenium: {url}")
-                driver.get(url)
+            await ws.send(json.dumps({
+                "id": 10, "sessionId": session_id,
+                "method": "Runtime.evaluate",
+                "params": {"expression": "document.documentElement.outerHTML", "returnByValue": True}
+            }))
 
-                # Wait for the body to be present
-                WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-                time.sleep(3)
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if r.get("id") == 10 and "result" in r:
+                    html = r["result"]["result"]["value"]
+                    logger.info(f"Lightpanda fetched {len(html)} bytes of HTML")
+                    return html
+                elif r.get("id") == 10:
+                    logger.error(f"Lightpanda evaluate error: {str(r)[:200]}")
+                    return None
+    except asyncio.TimeoutError:
+        logger.error("Lightpanda page load timeout")
+        return None
+    except websockets.WebSocketException as e:
+        logger.error(f"Lightpanda connection error: {e}")
+        return None
 
-                # Try to close login popups
-                close_selectors = [
-                    '[aria-label="Close"]',
-                    '[aria-label="Cerrar"]',
-                    'div[role="button"][aria-label="Close"]'
-                ]
-                for selector in close_selectors:
-                    try:
-                        close_btn = driver.find_element(By.CSS_SELECTOR, selector)
-                        close_btn.click()
-                        time.sleep(1)
-                        logger.info(f"Closed popup with: {selector}")
-                        break
-                    except:
-                        pass
-
-                # Click "Ver más" / "See more" button to expand description
-                see_more_selectors = [
-                    'div[role="button"]:not([aria-label])',  # Generic button divs
-                    '[role="button"]'
-                ]
-
-                # Try multiple approaches to find "Ver más" or "See more"
-                see_more_clicked = False
-                try:
-                    # Find all role="button" elements and look for text content
-                    buttons = driver.find_elements(By.CSS_SELECTOR, 'div[role="button"]')
-                    for btn in buttons:
-                        btn_text = btn.text.lower().strip()
-                        if btn_text in ['ver más', 'see more', 'más', 'more']:
-                            try:
-                                btn.click()
-                                see_more_clicked = True
-                                logger.info(f"Clicked 'Ver más' button")
-                                time.sleep(2)
-                                break
-                            except:
-                                pass
-                except Exception as e:
-                    logger.debug(f"See more click attempt failed: {e}")
-
-                # Get full page source after clicking
-                html = driver.page_source
-                return html
-
-            finally:
-                if driver:
-                    driver.quit()
-
-        html = await asyncio.to_thread(selenium_scrape)
-
+async def scrape_facebook_images(url: str, temp_dir: str):
+    """Scrape images from Facebook using Lightpanda browser (via CDP over WebSocket)"""
+    try:
+        html = await fetch_html_via_lightpanda(url)
         if not html:
-            logger.error("Failed to get page source from Selenium")
             return [], None
-
-        logger.info(f"Fetched {len(html)} bytes of HTML via Selenium")
 
         soup = BeautifulSoup(html, 'lxml')
 
@@ -472,73 +429,43 @@ async def scrape_facebook_images(url: str, temp_dir: str):
         if description:
             logger.info(f"Found description ({len(description)} chars): {description[:100]}...")
 
-        # Extract image URLs from img tags
+        # Extract image URLs — prefer og:image (canonical main image)
         og_images = []
+        og_meta = soup.find('meta', property='og:image')
+        if og_meta and og_meta.get('content'):
+            main_img = og_meta['content']
+            logger.info(f"Found og:image: {main_img[:80]}...")
+            og_images.append({'content': main_img})
+        else:
+            # Fallback: find all scontent img tags
+            img_tags = soup.find_all('img')
+            logger.info(f"No og:image, found {len(img_tags)} img tags")
 
-        # Find all img tags
-        img_tags = soup.find_all('img')
-        logger.info(f"Found {len(img_tags)} img tags")
+            seen_urls = set()
+            for img in img_tags:
+                src = img.get('src', '')
+                if not src or src in seen_urls:
+                    continue
 
-        # Extract unique sources
-        seen_urls = set()
-        for img in img_tags:
-            src = img.get('src', '')
-            if not src or src in seen_urls:
-                continue
+                if '/v/t' in src and 'scontent' in src:
+                    seen_urls.add(src)
+                    og_images.append({'content': src})
 
-            # Match: scontent with /v/t (real images from posts)
-            # Skip: static.xx (icons), emojis, reactions
-            is_real_image = '/v/t' in src and 'scontent' in src
-
-            if is_real_image:
-                seen_urls.add(src)
-                og_images.append({'content': src})
-                logger.info(f"Found real image: {src[:80]}...")
-
-        logger.info(f"Total real images found: {len(og_images)}")
+        logger.info(f"Total images to download: {len(og_images)}")
 
         if not og_images:
             logger.info("No images found")
             return [], description
 
         # Download images
-        import subprocess
-        for idx, og_img in enumerate(og_images[:10]):  # Limit to 10 images
+        for idx, og_img in enumerate(og_images[:10]):
             img_url = og_img.get('content') if isinstance(og_img, dict) else og_img.get('content')
-
             if not img_url:
                 continue
-
-            logger.info(f"Processing image: {img_url[:80]}...")
-
-            if 'scontent' in img_url:
-                img_url = img_url.replace('&amp;', '&')
-
-                try:
-                    img_filename = os.path.join(temp_dir, f"facebook_image_{idx}.jpg")
-
-                    curl_img_command = [
-                        'curl', '-L', '-o', img_filename,
-                        '-A', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
-                        img_url
-                    ]
-
-                    img_result = await asyncio.to_thread(
-                        subprocess.run,
-                        curl_img_command,
-                        capture_output=True,
-                        timeout=30
-                    )
-
-                    if img_result.returncode == 0 and os.path.exists(img_filename):
-                        # Check file size to filter out tiny images
-                        if os.path.getsize(img_filename) > 5000:
-                            images.append(img_filename)
-                            logger.info(f"Downloaded Facebook image {idx+1}: {img_filename}")
-                        else:
-                            os.remove(img_filename)
-                except Exception as e:
-                    logger.error(f"Failed to download image {idx}: {e}")
+            img_url = img_url.replace('&amp;', '&')
+            img_result = await _download_image_curl(img_url, temp_dir, f"facebook_image_{idx}")
+            if img_result:
+                images.append(img_result)
 
         return images, description
 
@@ -547,96 +474,129 @@ async def scrape_facebook_images(url: str, temp_dir: str):
         return [], None
 
 async def scrape_instagram_images(url: str, temp_dir: str):
-    """Scrape images directly from Instagram HTML"""
+    """Scrape images from Instagram using instaloader"""
     try:
-        import subprocess
+        import instaloader
 
-        curl_command = [
-            'curl', '-L', '-A',
-            'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-            url
-        ]
+        shortcode_match = re.search(r'/(?:p|reel|tv)/([A-Za-z0-9_-]+)', url)
+        if not shortcode_match:
+            logger.error(f"Could not extract shortcode from Instagram URL: {url}")
+            return [], None
+        shortcode = shortcode_match.group(1)
+        logger.info(f"Instagram shortcode: {shortcode}")
 
-        result = await asyncio.to_thread(
-            subprocess.run,
-            curl_command,
-            capture_output=True,
-            text=True,
-            timeout=30
+        loader = instaloader.Instaloader(
+            download_videos=False,
+            download_video_thumbnails=False,
+            compress_json=False,
+            save_metadata=True,
+            max_connection_attempts=3,
+            dirname_pattern=temp_dir,
         )
 
-        if result.returncode != 0:
-            logger.error(f"curl failed with return code: {result.returncode}")
-            return [], None
+        post = await asyncio.to_thread(
+            instaloader.Post.from_shortcode, loader.context, shortcode
+        )
+        description = post.caption or ""
 
-        html = result.stdout
-        logger.info(f"Fetched {len(html)} bytes of HTML via curl from Instagram")
+        await asyncio.to_thread(loader.download_post, post, temp_dir)
+
+        # Find downloaded files
+        images = []
+        for f in sorted(os.listdir(temp_dir)):
+            fp = os.path.join(temp_dir, f)
+            if f.endswith('.jpg') and os.path.isfile(fp) and os.path.getsize(fp) > 5000:
+                images.append(fp)
+
+        # Read caption from .txt file if instaloader created one
+        txt_files = [f for f in os.listdir(temp_dir) if f.endswith('.txt')]
+        if txt_files:
+            txt_path = os.path.join(temp_dir, txt_files[0])
+            try:
+                async with aiofiles.open(txt_path, 'r') as f:
+                    txt_content = await f.read()
+                    if txt_content.strip():
+                        description = txt_content.strip()
+            except Exception:
+                pass
+
+        logger.info(f"Instaloader: {len(images)} images, description={len(description)} chars")
+        return images, description
+
+    except Exception as e:
+        logger.error(f"Instaloader error: {e}", exc_info=True)
+        return [], None
+
+async def _download_image_curl(img_url: str, temp_dir: str, filename_base: str) -> str | None:
+    """Download a single image via curl"""
+    import subprocess
+    try:
+        img_filename = os.path.join(temp_dir, f"{filename_base}.jpg")
+        curl_cmd = [
+            'curl', '-L', '-o', img_filename,
+            '-A', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+            img_url
+        ]
+        result = await asyncio.to_thread(
+            subprocess.run, curl_cmd, capture_output=True, timeout=30
+        )
+        if result.returncode == 0 and os.path.exists(img_filename) and os.path.getsize(img_filename) > 5000:
+            logger.info(f"Downloaded {filename_base}: {img_filename}")
+            return img_filename
+        if os.path.exists(img_filename):
+            os.remove(img_filename)
+        return None
+    except Exception as e:
+        logger.error(f"Failed to download {filename_base}: {e}")
+        return None
+
+async def scrape_reddit_images(url: str, temp_dir: str):
+    """Scrape images from Reddit using Lightpanda browser"""
+    try:
+        html = await fetch_html_via_lightpanda(url)
+        if not html:
+            return [], None
 
         soup = BeautifulSoup(html, 'lxml')
 
         images = []
         description = None
 
-        # Extract caption/description from various possible locations
-        # Try meta description first
-        og_description = soup.find('meta', property='og:description')
-        if og_description and og_description.get('content'):
-            description = og_description['content']
-            logger.info(f"Found Instagram description: {description[:100]}")
+        for meta_attrs in [{'property': 'og:description'}, {'name': 'description'}]:
+            meta = soup.find('meta', attrs=meta_attrs)
+            if meta and meta.get('content'):
+                description = meta['content']
+                break
 
-        # Find all image tags with cdninstagram.com in src
-        img_tags = soup.find_all('img', src=lambda x: x and 'cdninstagram.com' in x)
+        for meta_attrs in [{'property': 'og:image'}, {'name': 'twitter:image'}]:
+            meta = soup.find('meta', attrs=meta_attrs)
+            if meta and meta.get('content'):
+                main_img = meta['content']
+                logger.info(f"Found Reddit {meta_attrs}: {main_img[:80]}...")
+                img_result = await _download_image_curl(main_img, temp_dir, "reddit_image_0")
+                if img_result:
+                    images.append(img_result)
+                return images, description
 
-        if not img_tags:
-            logger.info("No Instagram CDN images found in HTML")
-            return [], None
-
-        logger.info(f"Found {len(img_tags)} Instagram images")
-
-        for idx, img_tag in enumerate(img_tags):
-            img_url = img_tag.get('src')
-
-            if img_url and 'cdninstagram.com' in img_url:
-                # Get alt text as additional description
-                alt_text = img_tag.get('alt', '')
-                if alt_text and not description:
-                    description = alt_text
-
-                # Download the image using curl
-                try:
-                    img_filename = os.path.join(temp_dir, f"instagram_image_{idx}.jpg")
-
-                    curl_img_command = [
-                        'curl', '-L', '-o', img_filename,
-                        '-A', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-                        img_url
-                    ]
-
-                    img_result = await asyncio.to_thread(
-                        subprocess.run,
-                        curl_img_command,
-                        capture_output=True,
-                        timeout=30
-                    )
-
-                    if img_result.returncode == 0 and os.path.exists(img_filename):
-                        # Verify file is actually an image (not an error page)
-                        if os.path.getsize(img_filename) > 1000:  # At least 1KB
-                            images.append(img_filename)
-                            logger.info(f"Downloaded Instagram image {idx+1}: {img_filename}")
-                        else:
-                            logger.warning(f"Image {idx} too small, skipping")
-                            os.remove(img_filename)
-                    else:
-                        logger.error(f"Failed to download Instagram image {idx}")
-                except Exception as e:
-                    logger.error(f"Failed to download Instagram image {idx}: {e}")
-                    continue
+        img_tags = soup.find_all('img')
+        logger.info(f"No og:image, scanning {len(img_tags)} img tags for Reddit...")
+        seen = set()
+        for img in img_tags:
+            src = img.get('src', '')
+            if not src or src in seen:
+                continue
+            if any(x in src for x in ['preview.redd.it', 'i.redd.it', 'external-preview.redd.it']):
+                seen.add(src)
+                title = img.get('alt', '')
+                if title and not description:
+                    description = title
+                img_result = await _download_image_curl(src, temp_dir, f"reddit_image_{len(images)}")
+                if img_result:
+                    images.append(img_result)
 
         return images, description
-
     except Exception as e:
-        logger.error(f"Instagram scraping error: {e}")
+        logger.error(f"Reddit scraping error: {e}", exc_info=True)
         return [], None
 
 async def download_images(url: str, temp_dir: str):
@@ -738,10 +698,10 @@ async def handle_url(message: types.Message):
         await message.answer("🎵 TikTok detected! Downloading...")
         await download_and_send(message, url, 'video')
     elif is_reddit(url):
-        # Reddit videos and galleries
-        logger.info(f"Reddit detected: {url}")
+        # Reddit images and videos — try images first, fallback to video
+        logger.info(f"Reddit detected (images/video): {url}")
         await message.answer("🤖 Reddit detected! Downloading...")
-        await download_and_send(message, url, 'video')
+        await download_and_send_images(message, url)
     elif is_twitter(url):
         # Twitter/X videos and images
         logger.info(f"Twitter/X detected: {url}")
@@ -772,11 +732,10 @@ async def download_and_send_images(message: types.Message, url: str):
         description = ""
         image_files = []
 
-        # For Facebook /share/p/ URLs (images), skip cobalt and use Selenium directly
-        # cobalt doesn't work well for Facebook images - returns errors
+        # For Facebook /share/p/ URLs (images), use Lightpanda directly
         if 'facebook.com' in url and '/share/p/' in url:
-            logger.info("Facebook image detected, using Selenium directly...")
-            await status_msg.edit_text("⏳ Scraping with Selenium...")
+            logger.info("Facebook image detected, using Lightpanda...")
+            await status_msg.edit_text("⏳ Scraping with Lightpanda...")
             image_files, description = await scrape_facebook_images(url, temp_dir)
 
         # Other Facebook URLs (videos or legacy URLs)
@@ -826,14 +785,25 @@ async def download_and_send_images(message: types.Message, url: str):
                     logger.error(f"facebook-scraper failed: {e}")
 
                 if not image_files:
-                    # Final fallback to Selenium
-                    logger.info("facebook-scraper failed, trying Selenium...")
+                    # Fallback to Lightpanda
+                    logger.info("facebook-scraper failed, trying Lightpanda...")
                     image_files, description = await scrape_facebook_images(url, temp_dir)
 
-        # For Instagram, try HTML scraping
+        # For Reddit, try Lightpanda first (og:image), fallback to video
+        elif 'reddit.com' in url or 'redd.it' in url:
+            logger.info("Trying Lightpanda for Reddit...")
+            await status_msg.edit_text("⏳ Scraping with Lightpanda...")
+            image_files, description = await scrape_reddit_images(url, temp_dir)
+
+        # For Instagram, use instaloader
         elif 'instagram.com' in url:
-            logger.info("Trying Instagram HTML scraping...")
+            logger.info("Trying instaloader for Instagram...")
+            await status_msg.edit_text("⏳ Downloading via instaloader...")
             image_files, description = await scrape_instagram_images(url, temp_dir)
+            if not image_files:
+                logger.info("instaloader failed, trying gallery-dl...")
+                await status_msg.edit_text("⏳ Downloading via gallery-dl...")
+                image_files = await download_images(url, temp_dir)
 
         if 'facebook.com' in url and '/share/p/' in url and not image_files:
             # Facebook image posts should NOT fall back to video

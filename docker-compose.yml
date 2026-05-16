@@ -11,6 +11,7 @@ services:
     environment:
       - TZ=America/New_York
       - COBALT_URL=http://cobalt-api:9000
+      - LIGHTPANDA_URL=ws://lightpanda:9222
 
     volumes:
       - ./downloads:/app/downloads
@@ -19,6 +20,7 @@ services:
 
     depends_on:
       - cobalt-api
+      - lightpanda
 
     networks:
       - chinabici-net
@@ -59,6 +61,17 @@ services:
 
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - chinabici-net
+
+  lightpanda:
+    image: lightpanda/browser:nightly
+    container_name: lightpanda
+    restart: unless-stopped
+
+    expose:
+      - "9222"
 
     networks:
       - chinabici-net
