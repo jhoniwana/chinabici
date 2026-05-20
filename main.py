@@ -855,7 +855,7 @@ async def download_and_send_images(message: types.Message, url: str):
                 photo_input = BufferedInputFile(image_data, filename="image.jpg")
                 await message.answer_photo(
                     photo_input,
-                    caption=description if description else None,
+                    caption=description[:1024] if description else None,
                     reply_markup=delete_keyboard
                 )
         else:
@@ -868,7 +868,7 @@ async def download_and_send_images(message: types.Message, url: str):
 
                     # Add caption only to first image
                     if idx == 0 and description:
-                        media_group.append(InputMediaPhoto(media=photo_input, caption=description))
+                        media_group.append(InputMediaPhoto(media=photo_input, caption=description[:1024]))
                     else:
                         media_group.append(InputMediaPhoto(media=photo_input))
 
@@ -900,6 +900,7 @@ async def download_and_send_images(message: types.Message, url: str):
 
 async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None):
     status_msg = await message.answer("⏳ Downloading...")
+    downloaded_file = None
 
     try:
         ydl_opts = get_ydl_opts(url, format_type)
@@ -919,6 +920,7 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
 
             filesize = os.path.getsize(filename)
             title = info.get('title', 'video')
+            downloaded_file = filename
 
             await status_msg.edit_text("📤 Sending...")
 
@@ -1031,6 +1033,10 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
         # Auto-delete error message after 5 seconds
         asyncio.create_task(delete_message_after_delay(error_msg, 5))
+
+    finally:
+        if downloaded_file and os.path.exists(downloaded_file):
+            await cleanup_file(downloaded_file)
 
 @dp.callback_query(F.data.startswith("mp3:"))
 async def handle_mp3(callback: types.CallbackQuery):
