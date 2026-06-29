@@ -24,3 +24,5 @@ bot.py.old
 get-docker.sh
 model.json
 messages_clean.txt
+node_modules/
+package-lock.json

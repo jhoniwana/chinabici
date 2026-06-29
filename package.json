@@ -1,0 +1,8 @@
+{
+  "name": "chinabici-igdl",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "ultra-igdl": "^1.0.3"
+  }
+}

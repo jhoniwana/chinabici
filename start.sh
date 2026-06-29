@@ -18,6 +18,14 @@ source china/bin/activate 2>/dev/null || {
 }
 
 echo "✓ Entorno activado"
+
+# Install Node.js dependencies for ultra-igdl (Instagram downloads)
+if [ -f package.json ]; then
+    echo "✓ Instalando dependencias Node.js..."
+    npm install --omit=dev 2>/dev/null
+    echo "✓ Node.js dependencies ready"
+fi
+
 echo "✓ Iniciando bot..."
 echo ""
 

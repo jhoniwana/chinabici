@@ -265,6 +265,75 @@ async def download_via_cobalt(url: str, output_dir: str = "downloads") -> str | 
         logger.error(f"Error in cobalt: {e}", exc_info=True)
         return None
 
+async def download_instagram_via_ultraigdl(url: str, output_dir: str = "downloads") -> tuple[str | None, str | None]:
+    """Download Instagram video via ultra-igdl (Node.js package). Returns (filepath, caption)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'node', 'igdl_helper.js', url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            logger.error(f"ultra-igdl failed (exit {proc.returncode}): {stderr.decode()[:200]}")
+            return None, None
+
+        result = json.loads(stdout.decode())
+        if "error" in result:
+            logger.error(f"ultra-igdl error: {result['error']}")
+            return None, None
+
+        code = result.get("code", 0)
+        if code != 200:
+            logger.error(f"ultra-igdl API error (code {code}): {result.get('message', 'unknown')}")
+            return None, None
+
+        caption = result.get("caption", "") or ""
+        username = result.get("username", "") or ""
+
+        media = result.get("media", [])
+        if not media:
+            logger.error("ultra-igdl: no media in result")
+            return None, None
+
+        media_url = media[0].get("url")
+        if not media_url:
+            logger.error("ultra-igdl: no url in media[0]")
+            return None, None
+
+        logger.info(f"ultra-igdl got direct URL: {media_url[:80]}...")
+
+        from urllib.parse import urlparse
+        parsed = urlparse(media_url)
+        path = parsed.path
+        ext = path.split('.')[-1].split('?')[0] if '.' in path else 'mp4'
+        output_path = os.path.join(output_dir, f"ig_ultra.{ext}")
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                media_url,
+                timeout=aiohttp.ClientTimeout(total=120),
+                headers={"User-Agent": "Mozilla/5.0"}
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"ultra-igdl download failed: HTTP {resp.status}")
+                    return None, None
+                async with aiofiles.open(output_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        await f.write(chunk)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(f"ultra-igdl saved: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return output_path, caption
+        return None, None
+
+    except asyncio.TimeoutError:
+        logger.error("ultra-igdl timeout")
+        return None, None
+    except Exception as e:
+        logger.error(f"ultra-igdl error: {e}", exc_info=True)
+        return None, None
+
 async def compress_video(input_file: str) -> str | None:
     """Compress video using ffmpeg to reduce size for Telegram"""
     try:
@@ -471,6 +540,51 @@ async def scrape_facebook_images(url: str, temp_dir: str):
 
     except Exception as e:
         logger.error(f"Facebook scraping error: {e}", exc_info=True)
+        return [], None
+
+async def scrape_instagram_images_ultraigdl(url: str, temp_dir: str):
+    """Scrape images from Instagram using ultra-igdl (Node.js)."""
+    try:
+        import aiohttp
+        proc = await asyncio.create_subprocess_exec(
+            'node', 'igdl_helper.js', url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            return [], None
+
+        result = json.loads(stdout.decode())
+        if result.get("code") != 200:
+            return [], None
+
+        caption = result.get("caption", "") or ""
+        images = []
+        async with aiohttp.ClientSession() as session:
+            for idx, item in enumerate(result.get("media", [])):
+                if item.get("type") != "image":
+                    continue
+                img_url = item.get("url")
+                if not img_url:
+                    continue
+                img_path = os.path.join(temp_dir, f"ig_ultra_image_{idx}.jpg")
+                try:
+                    async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            async with aiofiles.open(img_path, 'wb') as f:
+                                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                                    await f.write(chunk)
+                            if os.path.getsize(img_path) > 5000:
+                                images.append(img_path)
+                except Exception as e:
+                    logger.warning(f"ultra-igdl image {idx} download failed: {e}")
+
+        logger.info(f"ultra-igdl: {len(images)} images, caption={len(caption)} chars")
+        return images, caption
+
+    except Exception as e:
+        logger.error(f"scrape_instagram_images_ultraigdl error: {e}", exc_info=True)
         return [], None
 
 async def scrape_instagram_images(url: str, temp_dir: str):
@@ -708,8 +822,15 @@ async def handle_url(message: types.Message):
         await message.answer("🐦 Twitter/X detected! Downloading...")
         await download_and_send(message, url, 'video')
     elif is_instagram_reel(url) or is_instagram_story(url):
-        # Instagram reels and stories are videos - skip image detection
+        # Instagram reels and stories are videos - try ultra-igdl first (yt-dlp broke)
         logger.info(f"Instagram video detected (reel/story): {url}")
+        status_msg = await message.answer("⏳ Downloading Instagram video...")
+        ig_file, ig_caption = await download_instagram_via_ultraigdl(url)
+        if ig_file:
+            await status_msg.edit_text("📤 Sending...")
+            await _send_video_file(message, ig_file, status_msg, original_url=url, caption=ig_caption)
+            return
+        await status_msg.edit_text("⏳ ultra-igdl failed, trying fallback...")
         await download_and_send(message, url, 'video')
     elif is_image_platform(url):
         # For Instagram posts and Facebook posts, try images first
@@ -795,11 +916,15 @@ async def download_and_send_images(message: types.Message, url: str):
             await status_msg.edit_text("⏳ Scraping with Lightpanda...")
             image_files, description = await scrape_reddit_images(url, temp_dir)
 
-        # For Instagram, use instaloader
+        # For Instagram, try ultra-igdl first, then instaloader
         elif 'instagram.com' in url:
-            logger.info("Trying instaloader for Instagram...")
-            await status_msg.edit_text("⏳ Downloading via instaloader...")
-            image_files, description = await scrape_instagram_images(url, temp_dir)
+            logger.info("Trying ultra-igdl for Instagram...")
+            await status_msg.edit_text("⏳ Downloading via ultra-igdl...")
+            image_files, description = await scrape_instagram_images_ultraigdl(url, temp_dir)
+            if not image_files:
+                logger.info("ultra-igdl failed, trying instaloader...")
+                await status_msg.edit_text("⏳ Downloading via instaloader...")
+                image_files, description = await scrape_instagram_images(url, temp_dir)
             if not image_files:
                 logger.info("instaloader failed, trying gallery-dl...")
                 await status_msg.edit_text("⏳ Downloading via gallery-dl...")
@@ -897,6 +1022,59 @@ async def download_and_send_images(message: types.Message, url: str):
         # Cleanup temp directory
         if temp_dir:
             await cleanup_directory(temp_dir)
+
+async def _send_video_file(message: types.Message, filepath: str, status_msg: types.Message, original_url: str = None, caption: str = None):
+    """Send a video file from a local path with proper formatting and cleanup."""
+    try:
+        filesize = os.path.getsize(filepath)
+        title = os.path.splitext(os.path.basename(filepath))[0]
+
+        import hashlib
+        delete_hash = hashlib.md5(f"{message.chat.id}:{message.message_id}".encode()).hexdigest()[:8]
+        original_messages[delete_hash] = {
+            'chat_id': message.chat.id,
+            'message_id': message.message_id
+        }
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑️ Delete original message", callback_data=f"del_orig:{delete_hash}")]
+        ])
+
+        if filesize > 50 * 1024 * 1024:
+            await status_msg.edit_text("🗜️ Compressing large video...")
+            compressed = await compress_video(filepath)
+            if compressed:
+                await cleanup_file(filepath)
+                filepath = compressed
+                filesize = os.path.getsize(filepath)
+
+        async with aiofiles.open(filepath, 'rb') as f:
+            file_data = await f.read()
+
+        video_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp4")
+
+        if original_url:
+            video_hash = hashlib.md5(f"{message.chat.id}:{filepath}".encode()).hexdigest()[:8]
+            pending_downloads[f"conv:{video_hash}"] = original_url
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎵 Convert to MP3", callback_data=f"convert_mp3:{video_hash}")],
+                [InlineKeyboardButton(text="🗑️ Delete original", callback_data=f"del_orig:{delete_hash}")]
+            ])
+
+        final_caption = caption[:1024] if caption else None
+
+        if filesize > 50 * 1024 * 1024:
+            await message.answer_document(video_input, caption=final_caption, reply_markup=keyboard)
+        else:
+            await message.answer_video(video_input, caption=final_caption, supports_streaming=True, reply_markup=keyboard)
+
+        await schedule_message_deletion(status_msg, message.chat.id, status_msg.message_id, 20)
+        await status_msg.delete()
+    except Exception as e:
+        logger.error(f"_send_video_file error: {e}", exc_info=True)
+        error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
+    finally:
+        await cleanup_file(filepath)
 
 async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None):
     status_msg = await message.answer("⏳ Downloading...")

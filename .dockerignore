@@ -14,3 +14,4 @@ logs/
 *.md
 .claude
 bot.py.old
+
