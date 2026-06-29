@@ -587,6 +587,121 @@ async def scrape_instagram_images_ultraigdl(url: str, temp_dir: str):
         logger.error(f"scrape_instagram_images_ultraigdl error: {e}", exc_info=True)
         return [], None
 
+async def scrape_instagram_images_via_lightpanda(url: str, temp_dir: str):
+    """Scrape images from Instagram using Lightpanda (CDP over WebSocket).
+    Navigates to the Instagram post, extracts the real post image URL from the
+    rendered DOM (filters profile pics/thumbnails), and downloads via aiohttp."""
+    try:
+        async with websockets.connect(LIGHTPANDA_URL, max_size=10_000_000) as ws:
+            await ws.send(json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": "about:blank"}}))
+            await ws.recv()
+            r = json.loads(await ws.recv())
+            target_id = r["result"]["targetId"]
+
+            await ws.send(json.dumps({"id": 2, "method": "Target.attachToTarget", "params": {"targetId": target_id}}))
+            r = json.loads(await ws.recv())
+            session_id = r["params"]["sessionId"]
+            await ws.recv()
+
+            logger.info(f"Lightpanda navigating to Instagram: {url}")
+            await ws.send(json.dumps({
+                "id": 3, "sessionId": session_id,
+                "method": "Page.navigate", "params": {"url": url}
+            }))
+
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=30))
+                if r.get("method") in ("Page.frameStoppedLoading", "Page.loadEventFired"):
+                    break
+
+            await asyncio.sleep(5)
+
+            extract_js = """
+(() => {
+    const imgs = Array.from(document.querySelectorAll('img'));
+    const postImages = imgs.filter(i => i.src && i.src.includes('fna.fbcdn'));
+    if (postImages.length > 0) {
+        return JSON.stringify(postImages.map(i => ({
+            src: i.src,
+            alt: i.alt || ''
+        })));
+    }
+    const allImgs = imgs.filter(i => i.src && !i.src.includes('static.cdninstagram.com'));
+    return JSON.stringify(allImgs.map(i => ({ src: i.src, alt: i.alt || '' })));
+})()
+"""
+            await ws.send(json.dumps({
+                "id": 10, "sessionId": session_id,
+                "method": "Runtime.evaluate",
+                "params": {"expression": extract_js, "returnByValue": True}
+            }))
+
+            result = None
+            while True:
+                r = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                if r.get("id") == 10 and "result" in r:
+                    result = r["result"]
+                    break
+
+            if not result:
+                logger.error("Lightpanda evaluate returned no result")
+                return [], None
+
+            val = result["result"].get("value", "[]")
+            imgs = json.loads(val) if isinstance(val, str) else val
+
+            if not imgs:
+                logger.info("Lightpanda found no images on Instagram page")
+                return [], None
+
+            profile_patterns = ['profile picture', 'profile_ pic', 'avatar']
+            candidate = None
+            fallback = None
+
+            for img in imgs:
+                alt_lower = (img.get('alt') or '').lower()
+                is_profile = any(p in alt_lower for p in profile_patterns)
+
+                if not is_profile and 'fna.fbcdn' in img.get('src', ''):
+                    candidate = img
+                    break
+                if not is_profile and not fallback:
+                    fallback = img
+
+            target_img = candidate or fallback or imgs[0]
+            img_url = target_img.get('src', '')
+            if not img_url:
+                logger.error("Lightpanda: extracted image has no src")
+                return [], None
+
+            logger.info(f"Lightpanda selected IG image: {img_url[:100]}...")
+
+            import aiohttp
+            img_path = os.path.join(temp_dir, "ig_lightpanda_image.jpg")
+            async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
+                async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        logger.error(f"Lightpanda image download HTTP {resp.status}")
+                        return [], None
+                    async with aiofiles.open(img_path, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(1024 * 1024):
+                            await f.write(chunk)
+
+            if os.path.getsize(img_path) > 5000:
+                logger.info(f"Lightpanda downloaded Instagram image: {img_path}")
+                return [img_path], target_img.get('alt') or None
+            return [], None
+
+    except asyncio.TimeoutError:
+        logger.error("Lightpanda timeout for Instagram")
+        return [], None
+    except websockets.WebSocketException as e:
+        logger.error(f"Lightpanda WS error for Instagram: {e}")
+        return [], None
+    except Exception as e:
+        logger.error(f"Lightpanda Instagram scraper error: {e}", exc_info=True)
+        return [], None
+
 async def scrape_instagram_images(url: str, temp_dir: str):
     """Scrape images from Instagram using instaloader"""
     try:
@@ -822,7 +937,8 @@ async def handle_url(message: types.Message):
         await message.answer("🐦 Twitter/X detected! Downloading...")
         await download_and_send(message, url, 'video')
     elif is_instagram_reel(url) or is_instagram_story(url):
-        # Instagram reels and stories are videos - try ultra-igdl first (yt-dlp broke)
+        # Instagram reels/stories — try video first via ultra-igdl, then yt-dlp/cobalt
+        # If video fails, try image extraction as last resort (photo-reels)
         logger.info(f"Instagram video detected (reel/story): {url}")
         status_msg = await message.answer("⏳ Downloading Instagram video...")
         ig_file, ig_caption = await download_instagram_via_ultraigdl(url)
@@ -830,8 +946,13 @@ async def handle_url(message: types.Message):
             await status_msg.edit_text("📤 Sending...")
             await _send_video_file(message, ig_file, status_msg, original_url=url, caption=ig_caption)
             return
-        await status_msg.edit_text("⏳ ultra-igdl failed, trying fallback...")
-        await download_and_send(message, url, 'video')
+        # Schedule the retry message for auto-deletion
+        retry_msg = await status_msg.edit_text("⏳ ultra-igdl failed, trying video fallback...")
+        asyncio.create_task(delete_message_after_delay(retry_msg, 10))
+        video_ok = await download_and_send(message, url, 'video')
+        if not video_ok:
+            logger.info("Video download failed, trying image extraction as last resort...")
+            await download_and_send_images(message, url)
     elif is_image_platform(url):
         # For Instagram posts and Facebook posts, try images first
         # If it fails or has no images, it will fall back to video
@@ -916,13 +1037,17 @@ async def download_and_send_images(message: types.Message, url: str):
             await status_msg.edit_text("⏳ Scraping with Lightpanda...")
             image_files, description = await scrape_reddit_images(url, temp_dir)
 
-        # For Instagram, try ultra-igdl first, then instaloader
+        # For Instagram, try ultra-igdl first, then Lightpanda, then instaloader
         elif 'instagram.com' in url:
             logger.info("Trying ultra-igdl for Instagram...")
             await status_msg.edit_text("⏳ Downloading via ultra-igdl...")
             image_files, description = await scrape_instagram_images_ultraigdl(url, temp_dir)
             if not image_files:
-                logger.info("ultra-igdl failed, trying instaloader...")
+                logger.info("ultra-igdl failed, trying Lightpanda...")
+                await status_msg.edit_text("⏳ Scraping with Lightpanda...")
+                image_files, description = await scrape_instagram_images_via_lightpanda(url, temp_dir)
+            if not image_files:
+                logger.info("Lightpanda failed, trying instaloader...")
                 await status_msg.edit_text("⏳ Downloading via instaloader...")
                 image_files, description = await scrape_instagram_images(url, temp_dir)
             if not image_files:
@@ -1076,7 +1201,8 @@ async def _send_video_file(message: types.Message, filepath: str, status_msg: ty
     finally:
         await cleanup_file(filepath)
 
-async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None):
+async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None) -> bool:
+    """Download and send a video/audio file. Returns True on success, False on failure."""
     status_msg = await message.answer("⏳ Downloading...")
     downloaded_file = None
 
@@ -1173,6 +1299,7 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
 
             await status_msg.delete()
             await cleanup_file(filename)
+            return True
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning(f"yt-dlp failed ({e}), trying cobalt...")
@@ -1199,18 +1326,20 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
 
             await status_msg.delete()
             await cleanup_file(cobalt_file)
+            return True
         else:
             error_msg = await status_msg.edit_text(
                 "❌ Could not download the video.\n\n"
                 "It may be private or require login."
             )
             asyncio.create_task(delete_message_after_delay(error_msg, 5))
+            return False
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        # Auto-delete error message after 5 seconds
         asyncio.create_task(delete_message_after_delay(error_msg, 5))
+        return False
 
     finally:
         if downloaded_file and os.path.exists(downloaded_file):
