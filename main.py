@@ -92,6 +92,10 @@ def get_ydl_opts(url='', format_type='video'):
         'no_warnings': True,
         'socket_timeout': 30,
         'retries': 3,
+        # NOTE: do NOT set 'impersonate' explicitly — yt-dlp 2026.07.4 has a
+        # bug (AssertionError) with explicit impersonate targets on py3.11.
+        # curl_cffi (pinned 0.11.0) is installed so TikTok's JS challenge is
+        # solved via the native path that works.
     }
 
     # Add cookies if available (for YouTube bot detection bypass)
