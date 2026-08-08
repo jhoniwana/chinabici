@@ -334,28 +334,120 @@ async def download_instagram_via_ultraigdl(url: str, output_dir: str = "download
         logger.error(f"ultra-igdl error: {e}", exc_info=True)
         return None, None
 
-async def compress_video(input_file: str) -> str | None:
-    """Compress video using ffmpeg to reduce size for Telegram"""
+MAX_TELEGRAM_BYTES = 48 * 1024 * 1024   # target under the 50 MB Bot API limit
+AUDIO_BITRATE = 96 * 1000                # aac 96k
+VAAPI_DEVICE = "/dev/dri/renderD128"
+
+
+async def _ffprobe_duration(input_file: str) -> float | None:
+    """Returns the duration in seconds, or None on failure."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', input_file,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        return float(out.decode().strip())
+    except Exception:
+        return None
+
+
+async def _vaapi_available() -> bool:
+    """Checks whether h264_vaapi can actually be used (vainfo + device)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'vainfo', '--display', 'drm', '--device', VAAPI_DEVICE,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+        return b'h264' in out.lower() or b'h264' in _.lower()
+    except Exception:
+        return False
+
+
+def _pick_resolution(video_bitrate: int) -> str:
+    """Resolution based on available video bitrate (lower = safer size)."""
+    if video_bitrate >= 2_000_000:
+        return "scale=1080:-2"
+    if video_bitrate >= 1_100_000:
+        return "scale=720:-2"
+    return "scale=540:-2"
+
+
+async def _run_ffmpeg(args: list[str]) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    await proc.communicate()
+    return proc.returncode == 0
+
+
+async def compress_video(input_file: str, target_mb: int = 48) -> str | None:
+    """Compress a video so it always fits under Telegram's 50 MB upload limit.
+
+    Strategy:
+      1. ffprobe the duration, compute a video bitrate so the whole file
+         lands under `target_mb` (with room for the 96k audio track).
+      2. Use h264_vaapi (hardware, ~5x faster) when the GPU is available,
+         otherwise fall back to libx264 (software).
+      3. If the result is still too big, retry with a lower bitrate and a
+         smaller resolution until it fits (max 4 attempts).
+    """
     try:
         base_name = os.path.splitext(input_file)[0]
-        output_file = f"{base_name}_compressed.mp4"
+        duration = await _ffprobe_duration(input_file)
+        if not duration or duration <= 0:
+            logger.warning(f"compress: could not read duration of {input_file}, using CRF fallback")
+            duration = None
 
-        # Compress: reduce resolution to 720p, lower bitrate
-        proc = await asyncio.create_subprocess_exec(
-            'ffmpeg', '-i', input_file,
-            '-vf', 'scale=-2:720',
-            '-vcodec', 'libx264', '-preset', 'fast',
-            '-acodec', 'aac', '-ab', '128k',
-            '-crf', '28', '-y', output_file,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        await proc.communicate()
+        vaapi = await _vaapi_available()
+        logger.info(f"compress: duration={duration}s vaapi={vaapi}")
 
-        if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-            logger.info(f"Compressed: {os.path.getsize(input_file)} -> {os.path.getsize(output_file)}")
-            return output_file
+        # video bitrate = (target_bytes * 8) / seconds - audio
+        video_bps = 1_200_000
+        if duration:
+            video_bps = int(target_mb * 1024 * 1024 * 8 / duration) - AUDIO_BITRATE
+            video_bps = max(250_000, video_bps)
 
+        # Intel iHD driver only supports CQP rate control, so VAAPI attempts
+        # step the quality (QP) instead of the bitrate; libx264 uses bitrate.
+        attempts = [
+            {"vbr": video_bps, "qp": 32, "res": _pick_resolution(video_bps)},
+            {"vbr": int(video_bps * 0.7), "qp": 36, "res": "scale=540:-2"},
+            {"vbr": int(video_bps * 0.45), "qp": 40, "res": "scale=480:-2"},
+            {"vbr": 300_000, "qp": 44, "res": "scale=360:-2"},
+        ]
+
+        for i, attempt in enumerate(attempts):
+            output_file = f"{base_name}_compressed.mp4"
+            vf = attempt["res"]
+            if vaapi:
+                vf = f"{vf},format=nv12,hwupload"
+                args = ['ffmpeg', '-y',
+                        '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
+                        '-filter_hw_device', 'va',
+                        '-i', input_file, '-vf', vf,
+                        '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
+                        '-c:a', 'aac', '-b:a', '96k',
+                        '-movflags', '+faststart', output_file]
+            else:
+                vf = vf + ",format=yuv420p"
+                args = ['ffmpeg', '-y', '-i', input_file, '-vf', vf,
+                        '-c:v', 'libx264', '-preset', 'fast',
+                        '-b:v', str(attempt["vbr"]),
+                        '-maxrate', str(int(attempt["vbr"] * 1.3)),
+                        '-bufsize', str(int(attempt["vbr"] * 2)),
+                        '-c:a', 'aac', '-b:a', '96k',
+                        '-movflags', '+faststart', output_file]
+
+            ok_run = await _run_ffmpeg(args)
+            if ok_run and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                size = os.path.getsize(output_file)
+                if size <= MAX_TELEGRAM_BYTES or i == len(attempts) - 1:
+                    logger.info(f"Compressed (attempt {i + 1}, vaapi={vaapi}): "
+                                f"{os.path.getsize(input_file)} -> {size} bytes")
+                    return output_file
+                os.remove(output_file)
+            else:
+                logger.warning(f"compress: attempt {i + 1} failed")
         return None
     except Exception as e:
         logger.error(f"Compression error: {e}")

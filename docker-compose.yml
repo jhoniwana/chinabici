@@ -18,6 +18,12 @@ services:
       - ./logs:/app/logs
       - ./model.json:/app/model.json
 
+    # GPU access for VAAPI hardware encoding (Intel/AMD iGPU)
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "985"
+
     depends_on:
       - cobalt-api
       - lightpanda
