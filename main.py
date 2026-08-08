@@ -82,7 +82,7 @@ async def _delete_scheduled(key: str, delay_seconds: int):
         except:
             pass
 
-def get_ydl_opts(url='', format_type='video'):
+def get_ydl_opts(url='', format_type='video', progress_cb=None):
     is_youtube = 'youtube.com' in url or 'youtu.be' in url
     is_reddit = 'reddit.com' in url or 'redd.it' in url
 
@@ -97,6 +97,18 @@ def get_ydl_opts(url='', format_type='video'):
         # curl_cffi (pinned 0.11.0) is installed so TikTok's JS challenge is
         # solved via the native path that works.
     }
+
+    if progress_cb:
+        def _hook(d):
+            if d.get('status') == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate')
+                downloaded = d.get('downloaded_bytes') or 0
+                if total:
+                    pct = int(downloaded / total * 100)
+                    asyncio.create_task(progress_cb(pct))
+            elif d.get('status') == 'finished':
+                asyncio.create_task(progress_cb(100))
+        base_opts['progress_hooks'] = [_hook]
 
     # Add cookies if available (for YouTube bot detection bypass)
     cookies_path = '/app/cookies.txt'
@@ -125,7 +137,9 @@ def get_ydl_opts(url='', format_type='video'):
             'merge_output_format': 'mp4',
         })
     else:
-        base_opts['format'] = 'best[ext=mp4]/best'
+        # Prefer h264 (TikTok's h264 variants carry a real muxed audio track;
+        # the bytevc1 1080p variant is video-only despite the format table)
+        base_opts['format'] = 'h264[ext=mp4]/best[ext=mp4]/best'
 
     return base_opts
 
@@ -343,6 +357,24 @@ AUDIO_BITRATE = 96 * 1000                # aac 96k
 VAAPI_DEVICE = "/dev/dri/renderD128"
 
 
+def render_progress_bar(pct: int, width: int = 14) -> str:
+    """Returns a text progress bar like '▓▓▓▓▓▓▓░░░░░░░ 58%'."""
+    pct = max(0, min(100, int(pct)))
+    filled = round(pct / 100 * width)
+    bar = "▓" * filled + "░" * (width - filled)
+    return f"{bar} {pct}%"
+
+
+async def update_status(status_msg: types.Message, emoji: str, text: str, pct: int | None = None):
+    """Edit the single per-download status message (rich streaming state)."""
+    try:
+        bar = f" {render_progress_bar(pct)}" if pct is not None else ""
+        await status_msg.edit_text(f"{emoji} {text}{bar}")
+    except Exception:
+        # Message may have been deleted already or edit raced — ignore
+        pass
+
+
 async def _ffprobe_duration(input_file: str) -> float | None:
     """Returns the duration in seconds, or None on failure."""
     try:
@@ -384,7 +416,7 @@ async def _run_ffmpeg(args: list[str]) -> bool:
     return proc.returncode == 0
 
 
-async def compress_video(input_file: str, target_mb: int = 48) -> str | None:
+async def compress_video(input_file: str, target_mb: int = 48, progress_cb=None) -> str | None:
     """Compress a video so it always fits under Telegram's 50 MB upload limit.
 
     Strategy:
@@ -394,6 +426,7 @@ async def compress_video(input_file: str, target_mb: int = 48) -> str | None:
          otherwise fall back to libx264 (software).
       3. If the result is still too big, retry with a lower bitrate and a
          smaller resolution until it fits (max 4 attempts).
+      4. When `progress_cb` is given, stream the encode progress (%).
     """
     try:
         base_name = os.path.splitext(input_file)[0]
@@ -442,7 +475,23 @@ async def compress_video(input_file: str, target_mb: int = 48) -> str | None:
                         '-c:a', 'aac', '-b:a', '96k',
                         '-movflags', '+faststart', output_file]
 
-            ok_run = await _run_ffmpeg(args)
+            # Stream encode progress through ffmpeg -progress pipe:1
+            args += ['-progress', 'pipe:1']
+            total_us = int(duration * 1_000_000) if duration else None
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                if total_us and progress_cb and line.startswith(b'out_time_us='):
+                    try:
+                        us = int(line.split(b'=', 1)[1].strip())
+                        await progress_cb(min(99, int(us / total_us * 100)))
+                    except Exception:
+                        pass
+            await proc.wait()
+            ok_run = proc.returncode == 0
             if ok_run and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                 size = os.path.getsize(output_file)
                 if size <= MAX_TELEGRAM_BYTES or i == len(attempts) - 1:
@@ -1015,23 +1064,23 @@ async def handle_url(message: types.Message):
     elif is_facebook_video(url):
         # Facebook videos (reels, watch, video posts) - download as video
         logger.info(f"Facebook video detected: {url}")
-        await message.answer("📹 Facebook video detected! Downloading...")
-        await download_and_send(message, url, 'video')
+        status_msg = await message.answer("📹 Facebook video detectado ⏳")
+        await download_and_send(message, url, 'video', status_msg=status_msg, platform_emoji="📹")
     elif is_tiktok(url):
         # TikTok videos
         logger.info(f"TikTok detected: {url}")
-        await message.answer("🎵 TikTok detected! Downloading...")
-        await download_and_send(message, url, 'video')
+        status_msg = await message.answer("🎵 TikTok detectado ⏳")
+        await download_and_send(message, url, 'video', status_msg=status_msg, platform_emoji="🎵")
     elif is_reddit(url):
         # Reddit images and videos — try images first, fallback to video
         logger.info(f"Reddit detected (images/video): {url}")
-        await message.answer("🤖 Reddit detected! Downloading...")
+        await message.answer("🤖 Reddit detectado! Descargando...")
         await download_and_send_images(message, url)
     elif is_twitter(url):
         # Twitter/X videos and images
         logger.info(f"Twitter/X detected: {url}")
-        await message.answer("🐦 Twitter/X detected! Downloading...")
-        await download_and_send(message, url, 'video')
+        status_msg = await message.answer("🐦 Twitter/X detectado ⏳")
+        await download_and_send(message, url, 'video', status_msg=status_msg, platform_emoji="🐦")
     elif is_instagram_reel(url) or is_instagram_story(url):
         # Instagram reels/stories — try video first via ultra-igdl, then yt-dlp/cobalt
         # If video fails, try image extraction as last resort (photo-reels)
@@ -1056,7 +1105,8 @@ async def handle_url(message: types.Message):
     else:
         # Generic video download for other platforms (1000+ sites)
         logger.info(f"Generic video download: {url}")
-        await download_and_send(message, url, 'video')
+        status_msg = await message.answer("⏳ Descargando...")
+        await download_and_send(message, url, 'video', status_msg=status_msg)
 
 async def download_and_send_images(message: types.Message, url: str):
     """Download and send images from Instagram/Facebook posts"""
@@ -1261,8 +1311,10 @@ async def _send_video_file(message: types.Message, filepath: str, status_msg: ty
         ])
 
         if filesize > 50 * 1024 * 1024:
-            await status_msg.edit_text("🗜️ Compressing large video...")
-            compressed = await compress_video(filepath)
+            await update_status(status_msg, "🗜️", "Comprimiendo", 0)
+            compressed = await compress_video(
+                filepath,
+                progress_cb=lambda pct: update_status(status_msg, "🗜️", "Comprimiendo", pct))
             if compressed:
                 await cleanup_file(filepath)
                 filepath = compressed
@@ -1288,118 +1340,175 @@ async def _send_video_file(message: types.Message, filepath: str, status_msg: ty
         else:
             await message.answer_video(video_input, caption=final_caption, supports_streaming=True, reply_markup=keyboard)
 
-        await schedule_message_deletion(status_msg, message.chat.id, status_msg.message_id, 20)
-        await status_msg.delete()
+        # Single status message: show a brief confirmation, then self-delete
+        await update_status(status_msg, "✅", "Enviado")
+        asyncio.create_task(delete_message_after_delay(status_msg, 10))
     except Exception as e:
         logger.error(f"_send_video_file error: {e}", exc_info=True)
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        asyncio.create_task(delete_message_after_delay(error_msg, 5))
+        asyncio.create_task(delete_message_after_delay(error_msg, 10))
     finally:
         await cleanup_file(filepath)
 
-async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None) -> bool:
-    """Download and send a video/audio file. Returns True on success, False on failure."""
-    status_msg = await message.answer("⏳ Downloading...")
+async def _file_has_audio(filepath: str) -> bool:
+    """True if the file has an audio stream (ffprobe)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-select_streams', 'a',
+            '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', filepath,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        return bool(out.decode().strip())
+    except Exception:
+        return True  # if we can't probe, assume it has audio
+
+
+async def _resolve_filename(ydl, info) -> str | None:
+    """Find the actual downloaded file (yt-dlp can pick another extension)."""
+    filename = ydl.prepare_filename(info)
+    if os.path.exists(filename):
+        return filename
+    base_name = os.path.splitext(filename)[0]
+    for ext in ['mp4', 'webm', 'mkv', 'avi', 'mov', 'mp3', 'm4a']:
+        test_file = f"{base_name}.{ext}"
+        if os.path.exists(test_file):
+            return test_file
+    return None
+
+
+async def download_and_send(message: types.Message, url: str, format_type: str, original_msg_id: int = None, status_msg: types.Message = None, platform_emoji: str = "⏳") -> bool:
+    """Download and send a video/audio file. Returns True on success, False on failure.
+
+    Uses a single `status_msg` (created here or passed by the caller) that is
+    edited in place with progress bars during download/compress/send, then
+    auto-deleted — so status messages never pile up in the group.
+    """
+    if status_msg is None:
+        status_msg = await message.answer(f"{platform_emoji} Descargando...")
     downloaded_file = None
 
     try:
-        ydl_opts = get_ydl_opts(url, format_type)
+        ydl_opts = get_ydl_opts(
+            url, format_type,
+            progress_cb=lambda pct: update_status(status_msg, "⬇️", "Descargando", pct))
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+        # TikTok's extractor is flaky (intermittent 'universal data for
+        # rehydration' errors, and sometimes only video-only formats are
+        # listed) — retry up to 3 times, preferring a file WITH audio.
+        info = None
+        filename = None
+        last_file = None
+        for intento in range(3):
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    filename = await _resolve_filename(ydl, info)
+                if filename and await _file_has_audio(filename):
+                    break
+                if filename:
+                    # Downloaded but no audio track (TikTok bytevc1 quirk) — retry
+                    last_file = filename
+                    if intento < 2:
+                        logger.warning(f"Download without audio (attempt {intento + 1}), retrying...")
+                        await update_status(status_msg, "🔁", f"Buscando versión con audio ({intento + 2}/3)")
+                        filename = None
+                    else:
+                        # Last attempt still silent — send it anyway
+                        filename = last_file
+                else:
+                    raise yt_dlp.utils.DownloadError("No downloaded file found")
+            except yt_dlp.utils.DownloadError as e:
+                if intento < 2 and ("universal data" in str(e) or "rehydration" in str(e)):
+                    await update_status(status_msg, "🔁", f"Reintentando ({intento + 2}/3)")
+                    await asyncio.sleep(3)
+                    continue
+                raise
+        if filename is None:
+            filename = last_file
 
-            if not os.path.exists(filename):
-                possible_exts = ['mp4', 'webm', 'mkv', 'avi', 'mov', 'mp3', 'm4a']
-                base_name = os.path.splitext(filename)[0]
-                for ext in possible_exts:
-                    test_file = f"{base_name}.{ext}"
-                    if os.path.exists(test_file):
-                        filename = test_file
-                        break
+        filesize = os.path.getsize(filename)
+        title = info.get('title', 'video')
+        downloaded_file = filename
 
-            filesize = os.path.getsize(filename)
-            title = info.get('title', 'video')
-            downloaded_file = filename
+        await update_status(status_msg, "📤", "Enviando")
 
-            await status_msg.edit_text("📤 Sending...")
+        async with aiofiles.open(filename, 'rb') as f:
+            file_data = await f.read()
 
-            async with aiofiles.open(filename, 'rb') as f:
-                file_data = await f.read()
+            # Create delete button for original message
+            import hashlib
+            delete_hash = hashlib.md5(f"{message.chat.id}:{original_msg_id or message.message_id}".encode()).hexdigest()[:8]
+            original_messages[delete_hash] = {
+                'chat_id': message.chat.id,
+                'message_id': original_msg_id or message.message_id
+            }
 
-                # Create delete button for original message
+            delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🗑️ Delete original message", callback_data=f"del_orig:{delete_hash}")]
+            ])
+
+            if format_type == 'audio':
+                audio_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp3")
+                await message.answer_audio(
+                    audio_input,
+                    caption=f"**{title[:100]}**",
+                    title=title[:100],
+                    reply_markup=delete_keyboard
+                )
+            else:
+                # Video - add MP3 convert button and schedule cleanup
                 import hashlib
-                delete_hash = hashlib.md5(f"{message.chat.id}:{original_msg_id or message.message_id}".encode()).hexdigest()[:8]
-                original_messages[delete_hash] = {
-                    'chat_id': message.chat.id,
-                    'message_id': original_msg_id or message.message_id
-                }
+                video_hash = hashlib.md5(f"{message.chat.id}:{filename}".encode()).hexdigest()[:8]
+                pending_downloads[f"conv:{video_hash}"] = url
 
-                delete_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🗑️ Delete original message", callback_data=f"del_orig:{delete_hash}")]
+                keyboard_with_mp3 = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🎵 Convert to MP3", callback_data=f"convert_mp3:{video_hash}"),
+                        InlineKeyboardButton(text="🗑️ Delete original", callback_data=f"del_orig:{delete_hash}")
+                    ]
                 ])
 
-                if format_type == 'audio':
-                    audio_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp3")
-                    await message.answer_audio(
-                        audio_input,
-                        caption=f"**{title[:100]}**",
-                        title=title[:100],
-                        reply_markup=delete_keyboard
-                    )
-                else:
-                    # Video - add MP3 convert button and schedule cleanup
-                    import hashlib
-                    video_hash = hashlib.md5(f"{message.chat.id}:{filename}".encode()).hexdigest()[:8]
-                    pending_downloads[f"conv:{video_hash}"] = url
+                video_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp4")
 
-                    keyboard_with_mp3 = InlineKeyboardMarkup(inline_keyboard=[
-                        [
-                            InlineKeyboardButton(text="🎵 Convert to MP3", callback_data=f"convert_mp3:{video_hash}"),
-                            InlineKeyboardButton(text="🗑️ Delete original", callback_data=f"del_orig:{delete_hash}")
-                        ]
-                    ])
+                if filesize > 50 * 1024 * 1024:
+                    # Compress video with ffmpeg (with live progress bar)
+                    await update_status(status_msg, "🗜️", "Comprimiendo", 0)
+                    compressed_file = await compress_video(
+                        filename,
+                        progress_cb=lambda pct: update_status(status_msg, "🗜️", "Comprimiendo", pct))
+                    if compressed_file:
+                        async with aiofiles.open(compressed_file, 'rb') as f:
+                            file_data = await f.read()
+                        filesize = len(file_data)
+                        await cleanup_file(filename)
+                        filename = compressed_file
+                        title = f"{title[:50]} (compressed)"
 
                     video_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp4")
 
-                    if filesize > 50 * 1024 * 1024:
-                        # Compress video with ffmpeg
-                        await status_msg.edit_text("🗜️ Compressing large video...")
-                        compressed_file = await compress_video(filename)
-                        if compressed_file:
-                            async with aiofiles.open(compressed_file, 'rb') as f:
-                                file_data = await f.read()
-                            filesize = len(file_data)
-                            await cleanup_file(filename)
-                            filename = compressed_file
-                            title = f"{title[:50]} (compressed)"
+                if filesize > 50 * 1024 * 1024:
+                    await message.answer_document(
+                        video_input,
+                        caption=f"**{title[:100]}**",
+                        reply_markup=keyboard_with_mp3
+                    )
+                else:
+                    await message.answer_video(
+                        video_input,
+                        caption=f"**{title[:100]}**",
+                        supports_streaming=True,
+                        reply_markup=keyboard_with_mp3
+                    )
 
-                        video_input = BufferedInputFile(file_data, filename=f"{title[:50]}.mp4")
-
-                    if filesize > 50 * 1024 * 1024:
-                        await message.answer_document(
-                            video_input,
-                            caption=f"**{title[:100]}**",
-                            reply_markup=keyboard_with_mp3
-                        )
-                    else:
-                        await message.answer_video(
-                            video_input,
-                            caption=f"**{title[:100]}**",
-                            supports_streaming=True,
-                            reply_markup=keyboard_with_mp3
-                        )
-
-                    # Schedule status message deletion
-                    await schedule_message_deletion(status_msg, message.chat.id, status_msg.message_id, 20)
-
-            await status_msg.delete()
-            await cleanup_file(filename)
-            return True
+        # Single status message: brief confirmation, then self-delete
+        await update_status(status_msg, "✅", "Enviado")
+        asyncio.create_task(delete_message_after_delay(status_msg, 10))
+        await cleanup_file(filename)
+        return True
 
     except yt_dlp.utils.DownloadError as e:
         logger.warning(f"yt-dlp failed ({e}), trying cobalt...")
-        await status_msg.edit_text("⏳ Trying alternative method...")
+        await update_status(status_msg, "🔁", "Intentando método alternativo")
 
         cobalt_file = await download_via_cobalt(url)
 
@@ -1407,7 +1516,7 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
             filesize = os.path.getsize(cobalt_file)
             title = url.split('/')[-1] or "video"
 
-            await status_msg.edit_text("📤 Sending...")
+            await update_status(status_msg, "📤", "Enviando")
 
             video_input = FSInputFile(cobalt_file, filename="video.mp4")
 
@@ -1420,7 +1529,8 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
                     supports_streaming=True
                 )
 
-            await status_msg.delete()
+            await update_status(status_msg, "✅", "Enviado (cobalt)")
+            asyncio.create_task(delete_message_after_delay(status_msg, 10))
             await cleanup_file(cobalt_file)
             return True
         else:
@@ -1428,13 +1538,13 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
                 "❌ Could not download the video.\n\n"
                 "It may be private or require login."
             )
-            asyncio.create_task(delete_message_after_delay(error_msg, 5))
+            asyncio.create_task(delete_message_after_delay(error_msg, 10))
             return False
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        asyncio.create_task(delete_message_after_delay(error_msg, 5))
+        asyncio.create_task(delete_message_after_delay(error_msg, 10))
         return False
 
     finally:
