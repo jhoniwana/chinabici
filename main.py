@@ -409,6 +409,19 @@ def _pick_resolution(video_bitrate: int) -> str:
     return "scale=540:-2"
 
 
+async def _video_codec(filepath: str) -> str | None:
+    """Return the video codec name (e.g. 'h264', 'hevc') via ffprobe."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', filepath,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, _ = await proc.communicate()
+        return out.decode().strip().lower() or None
+    except Exception:
+        return None
+
+
 async def _run_ffmpeg(args: list[str]) -> bool:
     proc = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -457,14 +470,30 @@ async def compress_video(input_file: str, target_mb: int = 48, progress_cb=None)
             output_file = f"{base_name}_compressed.mp4"
             vf = attempt["res"]
             if vaapi:
-                vf = f"{vf},format=nv12,hwupload"
-                args = ['ffmpeg', '-y',
-                        '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
-                        '-filter_hw_device', 'va',
-                        '-i', input_file, '-vf', vf,
-                        '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
-                        '-c:a', 'aac', '-b:a', '96k',
-                        '-movflags', '+faststart', output_file]
+                # For h264 inputs the whole pipeline can run on the GPU
+                # (decode + scale + encode) — ~30x faster than CPU decode.
+                codec = await _video_codec(input_file)
+                if codec == 'h264':
+                    vf = vf.replace('scale=', 'scale_vaapi=')
+                    args = ['ffmpeg', '-y',
+                            '-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi',
+                            '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
+                            '-filter_hw_device', 'va',
+                            '-i', input_file, '-vf', vf,
+                            '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
+                            '-c:a', 'aac', '-b:a', '96k',
+                            '-movflags', '+faststart', output_file]
+                else:
+                    # HEVC/other inputs have no GPU decoder on this Intel
+                    # driver — decode on CPU, encode on GPU.
+                    vf = f"{vf},format=nv12,hwupload"
+                    args = ['ffmpeg', '-y',
+                            '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
+                            '-filter_hw_device', 'va',
+                            '-i', input_file, '-vf', vf,
+                            '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
+                            '-c:a', 'aac', '-b:a', '96k',
+                            '-movflags', '+faststart', output_file]
             else:
                 vf = vf + ",format=yuv420p"
                 args = ['ffmpeg', '-y', '-i', input_file, '-vf', vf,
@@ -1363,6 +1392,30 @@ async def _file_has_audio(filepath: str) -> bool:
         return True  # if we can't probe, assume it has audio
 
 
+async def _best_h264_format_id(url: str) -> str | None:
+    """Extract format list and return the best h264 format_id that has a real
+    audio track (TikTok's h264 variants carry audio; bytevc1 -1 is video-only)."""
+    try:
+        opts = {'quiet': True, 'no_warnings': True, 'socket_timeout': 30}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        formats = info.get('formats') or []
+        candidates = [f for f in formats
+                      if f.get('vcodec') == 'h264' and f.get('acodec') not in (None, 'none')]
+        if not candidates:
+            candidates = [f for f in formats
+                          if (f.get('vcodec') or '').startswith('h264')
+                          and f.get('acodec') not in (None, 'none')]
+        if not candidates:
+            return None
+        # pick the highest resolution candidate
+        best = max(candidates, key=lambda f: (f.get('height') or 0, f.get('tbr') or 0))
+        return best.get('format_id')
+    except Exception as e:
+        logger.warning(f"_best_h264_format_id error: {e}")
+        return None
+
+
 async def _resolve_filename(ydl, info) -> str | None:
     """Find the actual downloaded file (yt-dlp can pick another extension)."""
     filename = ydl.prepare_filename(info)
@@ -1400,7 +1453,15 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
         last_file = None
         for intento in range(3):
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # After a silent attempt, force the best h264+audio format
+                # (TikTok's h264 variants carry a real audio track).
+                opts = dict(ydl_opts)
+                if intento > 0:
+                    fmt = await _best_h264_format_id(url)
+                    if fmt:
+                        opts['format'] = fmt
+                        logger.info(f"Retry {intento + 1} forcing h264+audio format: {fmt}")
+                with yt_dlp.YoutubeDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     filename = await _resolve_filename(ydl, info)
                 if filename and await _file_has_audio(filename):
