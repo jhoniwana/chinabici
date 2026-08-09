@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -205,6 +206,52 @@ def is_instagram_reel(url: str) -> bool:
 def is_instagram_story(url: str) -> bool:
     """Check if URL is an Instagram story"""
     return 'instagram.com' in url and ('/stories/' in url or '/story/' in url)
+
+async def download_via_tikwm(url: str, output_dir: str = "downloads") -> str | None:
+    """Download a TikTok video via tikwm.com API.
+
+    tikwm.com resolves TikTok videos server-side and returns the CDN URL with
+    a real muxed audio track — this bypasses TikTok's JS challenge/rate limits
+    that yt-dlp hits (universal data / unexpected response errors).
+    """
+    try:
+        logger.info(f"Trying tikwm for: {url}")
+        api = f"https://www.tikwm.com/api/?url={url}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    logger.error(f"tikwm responded HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+
+        if data.get("code") != 0:
+            logger.error(f"tikwm error: {data.get('msg')}")
+            return None
+
+        video_url = data.get("data", {}).get("play")
+        if not video_url:
+            logger.error("tikwm: no play URL in response")
+            return None
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(video_url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                if resp.status != 200:
+                    logger.error(f"tikwm video HTTP {resp.status}")
+                    return None
+                content = await resp.read()
+
+        filename = os.path.join(output_dir, f"tikwm_{int(time.time())}.mp4")
+        async with aiofiles.open(filename, 'wb') as f:
+            await f.write(content)
+
+        if os.path.getsize(filename) > 0:
+            logger.info(f"tikwm downloaded {os.path.getsize(filename)} bytes")
+            return filename
+        return None
+    except Exception as e:
+        logger.error(f"tikwm download error: {e}")
+        return None
+
 
 async def download_via_cobalt(url: str, output_dir: str = "downloads") -> str | None:
     """Download a video using cobalt-api (internal Docker service)."""
@@ -459,12 +506,29 @@ async def compress_video(input_file: str, target_mb: int = 48, progress_cb=None)
 
         # Intel iHD driver only supports CQP rate control, so VAAPI attempts
         # step the quality (QP) instead of the bitrate; libx264 uses bitrate.
-        attempts = [
-            {"vbr": video_bps, "qp": 32, "res": _pick_resolution(video_bps)},
-            {"vbr": int(video_bps * 0.7), "qp": 36, "res": "scale=540:-2"},
-            {"vbr": int(video_bps * 0.45), "qp": 40, "res": "scale=480:-2"},
-            {"vbr": 300_000, "qp": 44, "res": "scale=360:-2"},
-        ]
+        # Start close to the target so the FIRST attempt usually succeeds
+        # (otherwise the progress bar visibly resets on every retry).
+        if vaapi:
+            dur = duration or 240
+            if dur > 240:
+                qp_start, res_start = 40, "scale=540:-2"   # ~1.2 Mbps -> fits 48MB
+            elif dur > 120:
+                qp_start, res_start = 37, "scale=540:-2"   # ~2 Mbps
+            else:
+                qp_start, res_start = 34, "scale=720:-2"   # ~3.5 Mbps
+            attempts = [
+                {"vbr": video_bps, "qp": qp_start, "res": res_start},
+                {"vbr": int(video_bps * 0.7), "qp": qp_start + 3, "res": "scale=540:-2"},
+                {"vbr": int(video_bps * 0.45), "qp": qp_start + 6, "res": "scale=480:-2"},
+                {"vbr": 300_000, "qp": 44, "res": "scale=360:-2"},
+            ]
+        else:
+            attempts = [
+                {"vbr": video_bps, "qp": 32, "res": _pick_resolution(video_bps)},
+                {"vbr": int(video_bps * 0.7), "qp": 36, "res": "scale=540:-2"},
+                {"vbr": int(video_bps * 0.45), "qp": 40, "res": "scale=480:-2"},
+                {"vbr": 300_000, "qp": 44, "res": "scale=360:-2"},
+            ]
 
         for i, attempt in enumerate(attempts):
             output_file = f"{base_name}_compressed.mp4"
@@ -516,7 +580,7 @@ async def compress_video(input_file: str, target_mb: int = 48, progress_cb=None)
                 if total_us and progress_cb and line.startswith(b'out_time_us='):
                     try:
                         us = int(line.split(b'=', 1)[1].strip())
-                        await progress_cb(min(99, int(us / total_us * 100)))
+                        await progress_cb(min(99, int(us / total_us * 100)), i + 1)
                     except Exception:
                         pass
             await proc.wait()
@@ -1343,7 +1407,9 @@ async def _send_video_file(message: types.Message, filepath: str, status_msg: ty
             await update_status(status_msg, "🗜️", "Comprimiendo", 0)
             compressed = await compress_video(
                 filepath,
-                progress_cb=lambda pct: update_status(status_msg, "🗜️", "Comprimiendo", pct))
+                progress_cb=lambda pct, att=None: update_status(
+                    status_msg, "🗜️",
+                    f"Comprimiendo (paso {att}/4)" if att else "Comprimiendo", pct))
             if compressed:
                 await cleanup_file(filepath)
                 filepath = compressed
@@ -1536,7 +1602,9 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
                     await update_status(status_msg, "🗜️", "Comprimiendo", 0)
                     compressed_file = await compress_video(
                         filename,
-                        progress_cb=lambda pct: update_status(status_msg, "🗜️", "Comprimiendo", pct))
+                        progress_cb=lambda pct, att=None: update_status(
+                            status_msg, "🗜️",
+                            f"Comprimiendo (paso {att}/4)" if att else "Comprimiendo", pct))
                     if compressed_file:
                         async with aiofiles.open(compressed_file, 'rb') as f:
                             file_data = await f.read()
@@ -1568,31 +1636,53 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
         return True
 
     except yt_dlp.utils.DownloadError as e:
-        logger.warning(f"yt-dlp failed ({e}), trying cobalt...")
-        await update_status(status_msg, "🔁", "Intentando método alternativo")
+        logger.warning(f"yt-dlp failed ({e}), trying alternatives...")
+        alt_file = None
+        alt_label = ""
 
-        cobalt_file = await download_via_cobalt(url)
+        # For TikTok, tikwm.com bypasses the JS challenge/rate limits first
+        if 'tiktok.com' in url:
+            await update_status(status_msg, "🔁", "Probando tikwm...")
+            alt_file = await download_via_tikwm(url)
+            alt_label = "tikwm"
+        if not alt_file:
+            await update_status(status_msg, "🔁", "Probando cobalt...")
+            alt_file = await download_via_cobalt(url)
+            alt_label = "cobalt"
 
-        if cobalt_file:
-            filesize = os.path.getsize(cobalt_file)
+        if alt_file:
+            filesize = os.path.getsize(alt_file)
             title = url.split('/')[-1] or "video"
 
             await update_status(status_msg, "📤", "Enviando")
 
-            video_input = FSInputFile(cobalt_file, filename="video.mp4")
+            # Compress if needed (with live progress bar)
+            if filesize > 50 * 1024 * 1024:
+                await update_status(status_msg, "🗜️", "Comprimiendo", 0)
+                compressed = await compress_video(
+                    alt_file,
+                    progress_cb=lambda pct, att=None: update_status(
+                        status_msg, "🗜️",
+                        f"Comprimiendo (paso {att}/4)" if att else "Comprimiendo", pct))
+                if compressed:
+                    await cleanup_file(alt_file)
+                    alt_file = compressed
+                    filesize = os.path.getsize(alt_file)
+
+            video_input = FSInputFile(alt_file, filename=f"{title[:40]}.mp4")
 
             if filesize > 50 * 1024 * 1024:
-                await message.answer_document(video_input, caption="📥 Downloaded via cobalt")
+                await message.answer_document(video_input, caption=f"📥 vía {alt_label}")
             else:
                 await message.answer_video(
                     video_input,
-                    caption="📥 Downloaded via cobalt",
+                    caption=f"📥 vía {alt_label}",
                     supports_streaming=True
                 )
 
-            await update_status(status_msg, "✅", "Enviado (cobalt)")
+            await update_status(status_msg, "✅", f"Enviado ({alt_label})")
             asyncio.create_task(delete_message_after_delay(status_msg, 10))
-            await cleanup_file(cobalt_file)
+            await cleanup_file(alt_file)
             return True
         else:
             error_msg = await status_msg.edit_text(
