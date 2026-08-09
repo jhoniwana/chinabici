@@ -533,58 +533,66 @@ async def compress_video(input_file: str, target_mb: int = 48, progress_cb=None)
         for i, attempt in enumerate(attempts):
             output_file = f"{base_name}_compressed.mp4"
             vf = attempt["res"]
+            # Build command variants. Full-GPU (hwaccel + scale_vaapi) is ~30x
+            # faster but the VAAPI VPP pipeline can reject some inputs
+            # ('VAProfile is not supported'); CPU-decode+GPU-encode always works.
+            cmd_variants = []
             if vaapi:
-                # For h264 inputs the whole pipeline can run on the GPU
-                # (decode + scale + encode) — ~30x faster than CPU decode.
                 codec = await _video_codec(input_file)
                 if codec == 'h264':
-                    vf = vf.replace('scale=', 'scale_vaapi=')
-                    args = ['ffmpeg', '-y',
-                            '-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi',
-                            '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
-                            '-filter_hw_device', 'va',
-                            '-i', input_file, '-vf', vf,
-                            '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
-                            '-c:a', 'aac', '-b:a', '96k',
-                            '-movflags', '+faststart', output_file]
-                else:
-                    # HEVC/other inputs have no GPU decoder on this Intel
-                    # driver — decode on CPU, encode on GPU.
-                    vf = f"{vf},format=nv12,hwupload"
-                    args = ['ffmpeg', '-y',
-                            '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
-                            '-filter_hw_device', 'va',
-                            '-i', input_file, '-vf', vf,
-                            '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
-                            '-c:a', 'aac', '-b:a', '96k',
-                            '-movflags', '+faststart', output_file]
+                    vf_fast = vf.replace('scale=', 'scale_vaapi=')
+                    cmd_variants.append([
+                        'ffmpeg', '-y',
+                        '-hwaccel', 'vaapi', '-hwaccel_output_format', 'vaapi',
+                        '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
+                        '-filter_hw_device', 'va',
+                        '-i', input_file, '-vf', vf_fast,
+                        '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
+                        '-c:a', 'aac', '-b:a', '96k',
+                        '-movflags', '+faststart', output_file])
+                vf_robust = f"{vf},format=nv12,hwupload"
+                cmd_variants.append([
+                    'ffmpeg', '-y',
+                    '-init_hw_device', 'vaapi=va:/dev/dri/renderD128',
+                    '-filter_hw_device', 'va',
+                    '-i', input_file, '-vf', vf_robust,
+                    '-c:v', 'h264_vaapi', '-global_quality', str(attempt["qp"]),
+                    '-c:a', 'aac', '-b:a', '96k',
+                    '-movflags', '+faststart', output_file])
             else:
                 vf = vf + ",format=yuv420p"
-                args = ['ffmpeg', '-y', '-i', input_file, '-vf', vf,
-                        '-c:v', 'libx264', '-preset', 'fast',
-                        '-b:v', str(attempt["vbr"]),
-                        '-maxrate', str(int(attempt["vbr"] * 1.3)),
-                        '-bufsize', str(int(attempt["vbr"] * 2)),
-                        '-c:a', 'aac', '-b:a', '96k',
-                        '-movflags', '+faststart', output_file]
+                cmd_variants.append([
+                    'ffmpeg', '-y', '-i', input_file, '-vf', vf,
+                    '-c:v', 'libx264', '-preset', 'fast',
+                    '-b:v', str(attempt["vbr"]),
+                    '-maxrate', str(int(attempt["vbr"] * 1.3)),
+                    '-bufsize', str(int(attempt["vbr"] * 2)),
+                    '-c:a', 'aac', '-b:a', '96k',
+                    '-movflags', '+faststart', output_file])
 
-            # Stream encode progress through ffmpeg -progress pipe:1
-            args += ['-progress', 'pipe:1']
-            total_us = int(duration * 1_000_000) if duration else None
-            proc = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
+            ok_run = False
+            for args in cmd_variants:
+                if os.path.exists(output_file):
+                    os.remove(output_file)
+                # Stream encode progress through ffmpeg -progress pipe:1
+                args = list(args) + ['-progress', 'pipe:1']
+                total_us = int(duration * 1_000_000) if duration else None
+                proc = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    if total_us and progress_cb and line.startswith(b'out_time_us='):
+                        try:
+                            us = int(line.split(b'=', 1)[1].strip())
+                            await progress_cb(min(99, int(us / total_us * 100)), i + 1)
+                        except Exception:
+                            pass
+                await proc.wait()
+                if proc.returncode == 0:
+                    ok_run = True
                     break
-                if total_us and progress_cb and line.startswith(b'out_time_us='):
-                    try:
-                        us = int(line.split(b'=', 1)[1].strip())
-                        await progress_cb(min(99, int(us / total_us * 100)), i + 1)
-                    except Exception:
-                        pass
-            await proc.wait()
-            ok_run = proc.returncode == 0
             if ok_run and os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                 size = os.path.getsize(output_file)
                 if size <= MAX_TELEGRAM_BYTES or i == len(attempts) - 1:
