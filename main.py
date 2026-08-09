@@ -72,7 +72,7 @@ async def delete_message_after_delay(message: types.Message, delay: int = 5):
     """Delete a message after specified delay in seconds"""
     await asyncio.sleep(delay)
     try:
-        await message.delete()
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
     except Exception as e:
         logger.error(f"Failed to delete message: {e}")
 
@@ -1454,11 +1454,11 @@ async def _send_video_file(message: types.Message, filepath: str, status_msg: ty
 
         # Single status message: show a brief confirmation, then self-delete
         await update_status(status_msg, "✅", "Enviado")
-        asyncio.create_task(delete_message_after_delay(status_msg, 10))
+        asyncio.create_task(delete_message_after_delay(status_msg, 5))
     except Exception as e:
         logger.error(f"_send_video_file error: {e}", exc_info=True)
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        asyncio.create_task(delete_message_after_delay(error_msg, 10))
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
     finally:
         await cleanup_file(filepath)
 
@@ -1648,7 +1648,7 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
 
         # Single status message: brief confirmation, then self-delete
         await update_status(status_msg, "✅", "Enviado")
-        asyncio.create_task(delete_message_after_delay(status_msg, 10))
+        asyncio.create_task(delete_message_after_delay(status_msg, 5))
         await cleanup_file(filename)
         return True
 
@@ -1698,7 +1698,7 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
                 )
 
             await update_status(status_msg, "✅", f"Enviado ({alt_label})")
-            asyncio.create_task(delete_message_after_delay(status_msg, 10))
+            asyncio.create_task(delete_message_after_delay(status_msg, 5))
             await cleanup_file(alt_file)
             return True
         else:
@@ -1706,13 +1706,13 @@ async def download_and_send(message: types.Message, url: str, format_type: str, 
                 "❌ Could not download the video.\n\n"
                 "It may be private or require login."
             )
-            asyncio.create_task(delete_message_after_delay(error_msg, 10))
+            asyncio.create_task(delete_message_after_delay(error_msg, 5))
             return False
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         error_msg = await status_msg.edit_text(f"❌ Error: {str(e)[:100]}")
-        asyncio.create_task(delete_message_after_delay(error_msg, 10))
+        asyncio.create_task(delete_message_after_delay(error_msg, 5))
         return False
 
     finally:
