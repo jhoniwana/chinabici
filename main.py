@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, FSInputFile
 import yt_dlp
@@ -27,6 +28,9 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 COBALT_URL = os.getenv("COBALT_URL", "http://cobalt-api:9000")
 LIGHTPANDA_URL = os.getenv("LIGHTPANDA_URL", "ws://lightpanda:9222")
+# Optional Telegram Local Bot API Server: lifts the 50MB upload limit to 2GB.
+# When set, Bot uses the local server (see docker-compose bot-api-server).
+LOCAL_API_SERVER = os.getenv("LOCAL_API_SERVER", "")
 
 # Markov configuration
 MARKOV_ENABLED = os.getenv("MARKOV_ENABLED", "false").lower() in ("true", "1", "yes", "on")
@@ -50,7 +54,12 @@ logger = logging.getLogger(__name__)
 Path("downloads").mkdir(exist_ok=True)
 Path("logs").mkdir(exist_ok=True)
 
-bot = Bot(token=BOT_TOKEN)
+if LOCAL_API_SERVER:
+    # Local Bot API Server (aiogram/telegram-bot-api): no 50MB upload cap
+    bot = Bot(token=BOT_TOKEN, server=TelegramAPIServer.from_base(LOCAL_API_SERVER, is_local=True))
+    logger.info(f"Using Local Bot API Server at {LOCAL_API_SERVER}")
+else:
+    bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 pending_downloads = {}

@@ -12,6 +12,7 @@ services:
       - TZ=America/New_York
       - COBALT_URL=http://cobalt-api:9000
       - LIGHTPANDA_URL=ws://lightpanda:9222
+      - LOCAL_API_SERVER=${LOCAL_API_SERVER:-}
 
     volumes:
       - ./downloads:/app/downloads
@@ -27,6 +28,7 @@ services:
     depends_on:
       - cobalt-api
       - lightpanda
+      - bot-api-server
 
     networks:
       - chinabici-net
@@ -78,6 +80,30 @@ services:
 
     expose:
       - "9222"
+
+    networks:
+      - chinabici-net
+
+  # Telegram Local Bot API Server — lifts the 50MB upload limit to 2GB.
+  # Requires TELEGRAM_API_ID + TELEGRAM_API_HASH from https://my.telegram.org
+  bot-api-server:
+    image: aiogram/telegram-bot-api:latest
+    container_name: bot-api-server
+    restart: unless-stopped
+
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_LOCAL=1
+      - TELEGRAM_WORK_DIR=/var/lib/telegram-bot-api
+
+    volumes:
+      # shared with the bot so FSInputFile paths resolve on both sides
+      - ./downloads:/app/downloads
+      - ./tg-api-data:/var/lib/telegram-bot-api
+
+    expose:
+      - "8081"
 
     networks:
       - chinabici-net
