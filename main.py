@@ -102,7 +102,6 @@ def get_ydl_opts(url='', format_type='video', progress_cb=None):
         'no_warnings': True,
         'socket_timeout': 30,
         'retries': 3,
-        'js_runtimes': ['node'],
         # NOTE: do NOT set 'impersonate' explicitly — yt-dlp 2026.07.4 has a
         # bug (AssertionError) with explicit impersonate targets on py3.11.
         # curl_cffi (pinned 0.11.0) is installed so TikTok's JS challenge is
@@ -159,6 +158,13 @@ def get_ydl_opts(url='', format_type='video', progress_cb=None):
             'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
         })
+    elif 'tiktok.com' in url:
+        # TikTok web extractor breaks often ("unable to extract universal data").
+        # Force the mobile API extractor which is more stable. (verified 2026-08-13)
+        base_opts['format'] = 'h264[ext=mp4]/best[ext=mp4]/best'
+        base_opts['extractor_args'] = {
+            'tiktok': {'api_hostname': ['api.tiktokv.com', 'api16-normal-c-useast1a.tiktokv.com']}
+        }
     else:
         # Prefer h264 (TikTok's h264 variants carry a real muxed audio track;
         # the bytevc1 1080p variant is video-only despite the format table)
