@@ -102,6 +102,7 @@ def get_ydl_opts(url='', format_type='video', progress_cb=None):
         'no_warnings': True,
         'socket_timeout': 30,
         'retries': 3,
+        'js_runtimes': ['node'],
         # NOTE: do NOT set 'impersonate' explicitly — yt-dlp 2026.07.4 has a
         # bug (AssertionError) with explicit impersonate targets on py3.11.
         # curl_cffi (pinned 0.11.0) is installed so TikTok's JS challenge is
@@ -136,10 +137,22 @@ def get_ydl_opts(url='', format_type='video', progress_cb=None):
                 'preferredcodec': 'mp3',
                 'preferredquality': '192',
             }],
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'android_vr'],
+                }
+            },
         })
     elif is_youtube and format_type == 'video':
-        # iOS client provides different formats, use simple 'best' format
+        # Use android client: default web/tv clients fail on Shorts with
+        # "not available"/DRM. android client (and android_vr fallback) still
+        # resolves the stream without cookies/PO tokens. (verified 2026-08-13)
         base_opts['format'] = 'best'
+        base_opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['android', 'android_vr'],
+            }
+        }
     elif is_reddit:
         # Reddit needs more flexible format - video and audio are separate
         base_opts.update({
